@@ -1,9 +1,9 @@
 {
-	"id": "readwise-official",
-	"name": "Readwise Official",
-	"version": "3.0.1",
+	"id": "readwise-phillip",
+	"name": "Readwise (Phillip's Version)",
+	"version": "3.1.0",
 	"minAppVersion": "1.0.0",
-	"description": "Official Readwise <-> Obsidian integration",
+	"description": "Phillip's Versions of the Readwise <-> Obsidian integration",
 	"author": "Readwise",
 	"authorUrl": "https://readwise.io",
 	"isDesktopOnly": false
