@@ -26,6 +26,31 @@ Note: This plugin requires a subscription with [Readwise](https://readwise.io) â
 * Initiate the first sync
 * Thereafter, the plugin can be configured to sync automatically or manually
 
+## Building the Plugin
+
+To build this plugin from source:
+
+1. **Install dependencies**:
+   ```bash
+   npm install
+   ```
+
+2. **Build the plugin**:
+   - For production build:
+     ```bash
+     npm run build
+     ```
+   - For development with watch mode:
+     ```bash
+     npm run dev
+     ```
+   - To create a distribution package:
+     ```bash
+     npm run dist
+     ```
+
+The build process uses Rollup with TypeScript to compile the source code from `src/main.ts` into `main.js`.
+
 ## Support
 
 * Please see our [Documentation](https://help.readwise.io/article/125-how-does-the-readwise-to-obsidian-export-integration-work) or email us at hello@readwise.io ðŸ™‚
