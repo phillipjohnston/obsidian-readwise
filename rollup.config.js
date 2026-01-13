@@ -1,4 +1,4 @@
-import typescript from '@rollup/plugin-typescript';
+import esbuild from 'rollup-plugin-esbuild';
 import {nodeResolve} from '@rollup/plugin-node-resolve';
 import commonjs from '@rollup/plugin-commonjs';
 import dotenv from "rollup-plugin-dotenv";
@@ -14,6 +14,7 @@ export default {
   input: 'src/main.ts',
   output: {
     dir: '.',
+    sourcemap: 'inline',
     format: 'cjs',
     exports: 'default',
     banner,
@@ -21,7 +22,17 @@ export default {
   external: ['obsidian'],
   plugins: [
     dotenv(),
-    typescript(),
+    esbuild({
+      include: /\.[jt]sx?$/,
+      exclude: /node_modules/,
+      sourceMap: true,
+      minify: false,
+      target: 'es6',
+      tsconfig: 'tsconfig.json',
+      loaders: {
+        '.ts': 'ts'
+      }
+    }),
     nodeResolve({browser: true}),
     commonjs(),
   ]
