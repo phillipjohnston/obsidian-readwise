@@ -147,7 +147,7 @@ export default class ReadwisePlugin extends Plugin {
 
   /** Polls the Readwise API for the status of a given export;
    * uses recursion for polling so that it can be awaited. */
-  async getExportStatus(statusID: number, buttonContext?: ButtonComponent, _processedArtifactIds?: Set<number>) {
+  async getExportStatus(statusID: number, buttonContext?: ButtonComponent, _processedArtifactIds?: Set<number>, _unknownStatusCount?: number, _lastBooksExported?: number) {
     if (statusID <= this.settings.lastSavedStatusID) {
       console.log(`Readwise Official plugin: Already saved data from export ${statusID}`);
       await this.handleSyncSuccess(buttonContext);
@@ -155,6 +155,8 @@ export default class ReadwisePlugin extends Plugin {
       return;
     }
     const processedArtifactIds = _processedArtifactIds ?? new Set();
+    const unknownStatusCount = _unknownStatusCount ?? 0;
+    const lastBooksExported = _lastBooksExported ?? 0;
     const downloadUnprocessedArtifacts = async (allArtifactIds: number[]) => {
       for (const artifactId of allArtifactIds) {
         if (!processedArtifactIds.has(artifactId)) {
@@ -178,7 +180,44 @@ export default class ReadwisePlugin extends Plugin {
         const WAITING_STATUSES = ['PENDING', 'RECEIVED', 'STARTED', 'RETRY'];
         const SUCCESS_STATUSES = ['SUCCESS'];
 
-        if (WAITING_STATUSES.includes(data.taskStatus)) {
+        // Track if export is making progress
+        const currentBooksExported = data.booksExported || 0;
+        const isStuck = data.taskStatus === 'UNKNOWN' && currentBooksExported === lastBooksExported && currentBooksExported > 0;
+        const newUnknownCount = data.taskStatus === 'UNKNOWN' ? unknownStatusCount + 1 : 0;
+
+        // If UNKNOWN and no progress for 30 seconds, or UNKNOWN persists for 60 seconds total
+        if (data.taskStatus === 'UNKNOWN' && (unknownStatusCount >= 60 || (isStuck && unknownStatusCount >= 30))) {
+          console.log(`Readwise Official plugin: UNKNOWN status persisted for ${unknownStatusCount} attempts`);
+          console.log("Readwise Official plugin: data at timeout:", data);
+
+          // Check if export is actually complete
+          const isComplete = data.isFinished || (data.booksExported && data.totalBooks && data.booksExported >= data.totalBooks);
+
+          if (isComplete) {
+            console.log("Readwise Official plugin: Export appears complete despite UNKNOWN status");
+            // Treat as success
+            await downloadUnprocessedArtifacts(data.artifactIds);
+            await this.acknowledgeSyncCompleted(buttonContext);
+            await this.handleSyncSuccess(buttonContext, "Synced!", statusID);
+            this.notice("Readwise sync completed", true, 1, true);
+            console.log("Readwise Official plugin: completed sync");
+            // @ts-ignore
+            if (this.app.isMobile) {
+              this.notice("If you don't see all of your Readwise files, please reload the Obsidian app", true,);
+            }
+            return;
+          } else {
+            console.log("Readwise Official plugin: Export appears incomplete, treating as error");
+            await this.handleSyncError(buttonContext, "Sync timed out with UNKNOWN status");
+            return;
+          }
+        }
+
+        if (WAITING_STATUSES.includes(data.taskStatus) || data.taskStatus === 'UNKNOWN') {
+          if (data.taskStatus === 'UNKNOWN') {
+            const progressInfo = isStuck ? ` - STUCK at ${currentBooksExported}/${data.totalBooks}` : ` - progressing (${currentBooksExported}/${data.totalBooks})`;
+            console.log(`Readwise Official plugin: UNKNOWN status encountered (attempt ${newUnknownCount}/60)${progressInfo}`);
+          }
           if (data.booksExported) {
             const progressMsg = `Exporting Readwise data (${data.booksExported} / ${data.totalBooks}) ...`;
             this.notice(progressMsg, false, 35, true);
@@ -190,7 +229,7 @@ export default class ReadwisePlugin extends Plugin {
           // wait 1 second
           await new Promise(resolve => setTimeout(resolve, 1000));
           // then keep polling
-          await this.getExportStatus(statusID, buttonContext, processedArtifactIds);
+          await this.getExportStatus(statusID, buttonContext, processedArtifactIds, newUnknownCount, currentBooksExported);
         } else if (SUCCESS_STATUSES.includes(data.taskStatus)) {
           // make sure all artifacts are processed
           await downloadUnprocessedArtifacts(data.artifactIds);
@@ -205,8 +244,8 @@ export default class ReadwisePlugin extends Plugin {
 
           }
         } else {
-          console.log("Readwise Official plugin: unknown status in getExportStatus: ", data);
-          await this.handleSyncError(buttonContext, "Sync failed");
+          console.log("Readwise Official plugin: unexpected status in getExportStatus: ", data);
+          await this.handleSyncError(buttonContext, "Sync failed - unexpected status: " + data.taskStatus);
           return;
         }
       } else {
