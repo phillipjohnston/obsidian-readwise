@@ -698,7 +698,78 @@ export default class ReadwisePlugin extends Plugin {
       id: 'readwise-official-sync',
       name: 'Sync your data now',
       callback: () => {
+        console.log(`Readwise: Sync triggered. booksToRefresh: ${this.settings.booksToRefresh.length}, failedBooks: ${this.settings.failedBooks.length}`);
         this.syncBookHighlights();
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-force-refresh-queue',
+      name: 'Force sync refresh queue',
+      callback: async () => {
+        const totalToRefresh = this.settings.booksToRefresh.length + this.settings.failedBooks.length;
+
+        if (totalToRefresh === 0) {
+          new Notice('No books in refresh queue!', 5000);
+          return;
+        }
+
+        if (!this.settings.refreshBooks) {
+          new Notice('Warning: "Resync deleted files" is disabled. Enable it in settings to sync refresh queue.', 10000);
+          console.log(`Readwise: refreshBooks setting is false. booksToRefresh will not be synced.`);
+          return;
+        }
+
+        console.log(`Readwise: Force refreshing ${totalToRefresh} books`);
+        console.log(`Readwise: booksToRefresh: ${this.settings.booksToRefresh.length}`);
+        console.log(`Readwise: failedBooks: ${this.settings.failedBooks.length}`);
+        console.log(`Readwise: refreshBooks setting: ${this.settings.refreshBooks}`);
+
+        new Notice(`Force syncing ${totalToRefresh} books from refresh queue...`, 10000);
+
+        try {
+          // Call syncBookHighlights which should trigger refresh_book_export with forceRefresh
+          await this.syncBookHighlights();
+
+          console.log('Readwise: Force refresh completed');
+        } catch (e) {
+          console.error('Readwise: Error during force refresh:', e);
+          new Notice(`Error: ${e.message}`, 10000);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-clear-refresh-queue',
+      name: 'Clear refresh queue',
+      callback: async () => {
+        const totalItems = this.settings.booksToRefresh.length + this.settings.failedBooks.length;
+
+        if (totalItems === 0) {
+          new Notice('Refresh queue is already empty!', 5000);
+          return;
+        }
+
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("Clear refresh queue?");
+        modal.contentEl.createEl('p', {
+          text: `This will remove ${totalItems} items from the refresh queue (${this.settings.booksToRefresh.length} to refresh, ${this.settings.failedBooks.length} failed). They will NOT be synced unless re-added.`,
+          cls: 'rw-modal-warning-text',
+        });
+
+        const buttonsContainer = modal.contentEl.createEl('div', { cls: "rw-modal-btns" });
+        const cancelBtn = buttonsContainer.createEl("button", { text: "Cancel" });
+        const confirmBtn = buttonsContainer.createEl("button", { text: "Clear Queue", cls: 'mod-warning' });
+
+        cancelBtn.onclick = () => modal.close();
+        confirmBtn.onclick = async () => {
+          console.log(`Readwise: Clearing ${totalItems} items from refresh queue`);
+          this.settings.booksToRefresh = [];
+          this.settings.failedBooks = [];
+          await this.saveSettings();
+          new Notice('Refresh queue cleared', 5000);
+          modal.close();
+        };
+
+        modal.open();
       }
     });
     this.addCommand({
@@ -747,6 +818,611 @@ export default class ReadwisePlugin extends Plugin {
         } else {
           this.reimportFile(this.app.vault, activeFilePath);
         }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-diagnostics',
+      name: 'Show sync diagnostics',
+      callback: async () => {
+        const categories = ['Articles', 'Books', 'Podcasts', 'Tweets'];
+        let diagnosticInfo = '# Readwise Sync Diagnostics\n\n';
+
+        diagnosticInfo += '## Sync Status\n';
+        diagnosticInfo += `- Last Saved Status ID: ${this.settings.lastSavedStatusID}\n`;
+        diagnosticInfo += `- Current Sync Status ID: ${this.settings.currentSyncStatusID}\n`;
+        diagnosticInfo += `- Is Syncing: ${this.settings.isSyncing}\n`;
+        diagnosticInfo += `- Last Sync Failed: ${this.settings.lastSyncFailed}\n`;
+        diagnosticInfo += `- Refresh Books Enabled: ${this.settings.refreshBooks}\n`;
+        diagnosticInfo += `- Books To Refresh: ${this.settings.booksToRefresh.length}\n`;
+        diagnosticInfo += `- Failed Books: ${this.settings.failedBooks.length}\n\n`;
+
+        diagnosticInfo += '## Content by Category\n';
+        let totalFiles = 0;
+        for (const category of categories) {
+          const categoryPath = `${this.settings.readwiseDir}/${category}`;
+          try {
+            const files = await this.app.vault.adapter.list(categoryPath);
+            const mdFiles = files.files.filter(f => f.endsWith('.md'));
+            diagnosticInfo += `- ${category}: ${mdFiles.length} files\n`;
+            totalFiles += mdFiles.length;
+          } catch (e) {
+            diagnosticInfo += `- ${category}: 0 files (or directory doesn't exist)\n`;
+          }
+        }
+        diagnosticInfo += `\n**Total**: ${totalFiles} files\n\n`;
+
+        diagnosticInfo += '## Tracked Books\n';
+        diagnosticInfo += `- Total tracked in booksIDsMap: ${Object.keys(this.settings.booksIDsMap).length}\n\n`;
+
+        diagnosticInfo += '## Failed Books List\n';
+        if (this.settings.failedBooks.length > 0) {
+          diagnosticInfo += this.settings.failedBooks.map(id => `- ${id}`).join('\n');
+        } else {
+          diagnosticInfo += 'None\n';
+        }
+
+        diagnosticInfo += '\n\n## Books To Refresh List\n';
+        if (this.settings.booksToRefresh.length > 0) {
+          diagnosticInfo += this.settings.booksToRefresh.slice(0, 20).map(id => `- ${id}`).join('\n');
+          if (this.settings.booksToRefresh.length > 20) {
+            diagnosticInfo += `\n... and ${this.settings.booksToRefresh.length - 20} more`;
+          }
+        } else {
+          diagnosticInfo += 'None\n';
+        }
+
+        console.log(diagnosticInfo);
+        new Notice('Diagnostics printed to console', 5000);
+
+        // Also create a temp file with diagnostics
+        const tempFile = `${this.settings.readwiseDir}/Readwise-Diagnostics-${Date.now()}.md`;
+        await this.app.vault.create(tempFile, diagnosticInfo);
+        const file = this.app.vault.getAbstractFileByPath(tempFile);
+        if (file) {
+          // @ts-ignore
+          await this.app.workspace.getLeaf().openFile(file);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-clear-category',
+      name: 'Clear and resync a category',
+      callback: async () => {
+        const categories = ['Articles', 'Books', 'Podcasts', 'Tweets'];
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("Select category to clear and resync");
+        modal.contentEl.createEl('p', {
+          text: 'This will delete all files in the selected category and mark them for re-import on next sync.',
+          cls: 'rw-modal-warning-text',
+        });
+
+        const selectContainer = modal.contentEl.createEl('div', { cls: 'rw-modal-select' });
+        const select = selectContainer.createEl('select');
+        categories.forEach(cat => {
+          select.createEl('option', { text: cat, value: cat });
+        });
+
+        const buttonsContainer = modal.contentEl.createEl('div', { cls: "rw-modal-btns" });
+        const cancelBtn = buttonsContainer.createEl("button", { text: "Cancel" });
+        const confirmBtn = buttonsContainer.createEl("button", { text: "Clear & Resync", cls: 'mod-warning' });
+
+        cancelBtn.onclick = () => modal.close();
+        confirmBtn.onclick = async () => {
+          const selectedCategory = select.value;
+          const categoryPath = `${this.settings.readwiseDir}/${selectedCategory}`;
+
+          try {
+            const files = await this.app.vault.adapter.list(categoryPath);
+            const mdFiles = files.files.filter(f => f.endsWith('.md'));
+
+            new Notice(`Deleting ${mdFiles.length} files from ${selectedCategory}...`);
+
+            const bookIdsToRefresh: string[] = [];
+            for (const filePath of mdFiles) {
+              const bookId = this.settings.booksIDsMap[filePath];
+              if (bookId) {
+                bookIdsToRefresh.push(bookId);
+                delete this.settings.booksIDsMap[filePath];
+              }
+              await this.app.vault.adapter.remove(filePath);
+            }
+
+            // Add all book IDs to refresh list
+            this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...bookIdsToRefresh])];
+            await this.saveSettings();
+
+            new Notice(`Cleared ${selectedCategory}. Run sync to re-import.`, 5000);
+            console.log(`Readwise: Cleared ${mdFiles.length} files from ${selectedCategory}, marked ${bookIdsToRefresh.length} books for refresh`);
+          } catch (e) {
+            console.error('Error clearing category:', e);
+            new Notice(`Error clearing ${selectedCategory}: ${e.message}`, 5000);
+          }
+          modal.close();
+        };
+
+        modal.open();
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-find-duplicates',
+      name: 'Find duplicate filenames',
+      callback: async () => {
+        const categories = ['Articles', 'Books', 'Podcasts', 'Tweets'];
+        let duplicateReport = '# Duplicate Filename Report\n\n';
+        let foundDuplicates = false;
+
+        for (const category of categories) {
+          const categoryPath = `${this.settings.readwiseDir}/${category}`;
+          try {
+            const files = await this.app.vault.adapter.list(categoryPath);
+            const mdFiles = files.files.filter(f => f.endsWith('.md'));
+
+            const fileNames = mdFiles.map(f => f.split('/').pop());
+            const nameCounts: { [name: string]: number } = {};
+            fileNames.forEach(name => {
+              nameCounts[name] = (nameCounts[name] || 0) + 1;
+            });
+
+            const duplicates = Object.entries(nameCounts).filter(([_, count]) => count > 1);
+            if (duplicates.length > 0) {
+              foundDuplicates = true;
+              duplicateReport += `## ${category}\n`;
+              duplicates.forEach(([name, count]) => {
+                duplicateReport += `- ${name}: ${count} copies\n`;
+              });
+              duplicateReport += '\n';
+            }
+          } catch (e) {
+            // Category doesn't exist or error reading
+          }
+        }
+
+        if (!foundDuplicates) {
+          duplicateReport += 'No duplicate filenames found.\n';
+        }
+
+        console.log(duplicateReport);
+        new Notice('Duplicate report printed to console', 5000);
+
+        const tempFile = `${this.settings.readwiseDir}/Readwise-Duplicates-${Date.now()}.md`;
+        await this.app.vault.create(tempFile, duplicateReport);
+        const file = this.app.vault.getAbstractFileByPath(tempFile);
+        if (file) {
+          // @ts-ignore
+          await this.app.workspace.getLeaf().openFile(file);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-check-collisions',
+      name: 'Check for filename collisions',
+      callback: async () => {
+        let collisionReport = '# Filename Collision Report\n\n';
+        collisionReport += 'This report shows potential book ID collisions where multiple book IDs may map to the same filename.\n\n';
+
+        // Invert the booksIDsMap to find collisions
+        const idToPathMap: { [id: string]: string[] } = {};
+        Object.entries(this.settings.booksIDsMap).forEach(([path, id]) => {
+          if (!idToPathMap[id]) {
+            idToPathMap[id] = [];
+          }
+          idToPathMap[id].push(path);
+        });
+
+        // Find IDs that map to multiple paths (shouldn't happen)
+        const multiPathIds = Object.entries(idToPathMap).filter(([_, paths]) => paths.length > 1);
+
+        if (multiPathIds.length > 0) {
+          collisionReport += '## Multiple Paths for Same Book ID\n';
+          collisionReport += '(This indicates an internal tracking issue)\n\n';
+          multiPathIds.forEach(([id, paths]) => {
+            collisionReport += `### Book ID: ${id}\n`;
+            paths.forEach(p => collisionReport += `- ${p}\n`);
+            collisionReport += '\n';
+          });
+        } else {
+          collisionReport += '## Multiple Paths for Same Book ID\n';
+          collisionReport += 'None found (good!).\n\n';
+        }
+
+        // Check for files that exist but aren't tracked
+        collisionReport += '## Untracked Files\n';
+        collisionReport += '(Files in Readwise directory not in booksIDsMap)\n\n';
+
+        const categories = ['Articles', 'Books', 'Podcasts', 'Tweets'];
+        let untrackedCount = 0;
+        for (const category of categories) {
+          const categoryPath = `${this.settings.readwiseDir}/${category}`;
+          try {
+            const files = await this.app.vault.adapter.list(categoryPath);
+            const mdFiles = files.files.filter(f => f.endsWith('.md'));
+
+            const untracked = mdFiles.filter(f => !this.settings.booksIDsMap[f]);
+            if (untracked.length > 0) {
+              collisionReport += `### ${category} (${untracked.length} untracked)\n`;
+              untracked.slice(0, 10).forEach(f => {
+                const filename = f.split('/').pop();
+                collisionReport += `- ${filename}\n`;
+              });
+              if (untracked.length > 10) {
+                collisionReport += `... and ${untracked.length - 10} more\n`;
+              }
+              collisionReport += '\n';
+              untrackedCount += untracked.length;
+            }
+          } catch (e) {
+            // Category doesn't exist
+          }
+        }
+
+        if (untrackedCount === 0) {
+          collisionReport += 'None found (all files are tracked).\n\n';
+        } else {
+          collisionReport += `\n**Total untracked files**: ${untrackedCount}\n\n`;
+          collisionReport += '**Note**: Untracked files may indicate:\n';
+          collisionReport += '- Files created manually\n';
+          collisionReport += '- Files from a previous sync that lost tracking data\n';
+          collisionReport += '- Duplicate book titles that overwrote each other\n\n';
+        }
+
+        collisionReport += '## Summary\n';
+        collisionReport += `- Total tracked books: ${Object.keys(this.settings.booksIDsMap).length}\n`;
+        collisionReport += `- Total untracked files: ${untrackedCount}\n`;
+
+        console.log(collisionReport);
+        new Notice('Collision report printed to console', 5000);
+
+        const tempFile = `${this.settings.readwiseDir}/Readwise-Collisions-${Date.now()}.md`;
+        await this.app.vault.create(tempFile, collisionReport);
+        const file = this.app.vault.getAbstractFileByPath(tempFile);
+        if (file) {
+          // @ts-ignore
+          await this.app.workspace.getLeaf().openFile(file);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-find-missing',
+      name: 'Find and sync missing items',
+      callback: async () => {
+        new Notice('Querying Readwise API for all items...', 10000);
+        console.log('Readwise: Fetching all items from API...');
+
+        // Helper function to fetch with retry and rate limiting
+        // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
+        const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
+          for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+              const response = await fetch(url, {
+                headers: this.getAuthHeaders()
+              });
+
+              if (response.status === 429) {
+                // Rate limited - use Retry-After header
+                const retryAfter = response.headers.get('Retry-After');
+                const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 60s if no header
+                console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+                new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                continue;
+              }
+
+              if (!response.ok) {
+                throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+              }
+
+              return response;
+            } catch (e) {
+              if (attempt === maxRetries - 1) throw e;
+              const waitTime = Math.pow(2, attempt) * 1000;
+              console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+              await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+          }
+          throw new Error('Max retries exceeded');
+        };
+
+        try {
+          // Fetch all book IDs from Readwise API
+          let allApiBooks: any[] = [];
+          let nextUrl: string | null = 'https://readwise.io/api/v2/books/';
+          let pageCount = 0;
+
+          while (nextUrl && pageCount < 100) { // Safety limit of 100 pages
+            pageCount++;
+            const response = await fetchWithRetry(nextUrl);
+
+            const data = await response.json();
+            allApiBooks = allApiBooks.concat(data.results);
+            nextUrl = data.next;
+
+            if (pageCount % 5 === 0) {
+              console.log(`Readwise: Fetched ${allApiBooks.length} items so far...`);
+              new Notice(`Fetched ${allApiBooks.length} items... (page ${pageCount})`, 2000);
+            }
+
+            // Book LIST endpoint limited to 20 requests/minute = 3 seconds between requests
+            if (nextUrl) { // Don't wait after the last page
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+          }
+
+          console.log(`Readwise: Fetched total of ${allApiBooks.length} items from API`);
+
+          // Build set of tracked book IDs
+          const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
+          console.log(`Readwise: Currently tracking ${trackedIds.size} items locally`);
+
+          // Find missing items
+          const missingItems = allApiBooks.filter(book => {
+            const bookId = book.id.toString();
+            return !trackedIds.has(bookId);
+          });
+
+          console.log(`Readwise: Found ${missingItems.length} missing items`);
+
+          // Group by category
+          const categoryCounts: { [cat: string]: number } = {};
+          missingItems.forEach(item => {
+            const cat = item.category || 'unknown';
+            categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+          });
+
+          // Create report
+          let report = '# Missing Items Report\n\n';
+          report += `Found **${missingItems.length}** items in Readwise that are not downloaded locally.\n\n`;
+          report += '## Summary by Category\n';
+          Object.entries(categoryCounts).forEach(([cat, count]) => {
+            report += `- ${cat}: ${count} items\n`;
+          });
+          report += '\n## Missing Items (first 50)\n';
+          missingItems.slice(0, 50).forEach(item => {
+            report += `- [${item.category}] ${item.title} by ${item.author} (ID: ${item.id})\n`;
+          });
+          if (missingItems.length > 50) {
+            report += `\n... and ${missingItems.length - 50} more\n`;
+          }
+
+          report += '\n## Next Steps\n';
+          if (missingItems.length > 0) {
+            report += 'Options to sync these items:\n';
+            report += '1. Run "Force resync missing items" command to add them to refresh queue\n';
+            report += '2. Use recovery script to reset lastSavedStatusID and do a full resync\n';
+          } else {
+            report += 'All items from Readwise are downloaded! ✓\n';
+          }
+
+          console.log(report);
+          new Notice(`Found ${missingItems.length} missing items. Report created.`, 10000);
+
+          // Save report
+          const reportFile = `${this.settings.readwiseDir}/Readwise-Missing-Items-${Date.now()}.md`;
+          await this.app.vault.create(reportFile, report);
+          const file = this.app.vault.getAbstractFileByPath(reportFile);
+          if (file) {
+            // @ts-ignore
+            await this.app.workspace.getLeaf().openFile(file);
+          }
+
+        } catch (e) {
+          console.error('Readwise: Error finding missing items:', e);
+          new Notice(`Error: ${e.message}`, 10000);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-force-resync-missing',
+      name: 'Force resync missing items',
+      callback: async () => {
+        new Notice('Finding missing items to resync...', 10000);
+
+        // Helper function to fetch with retry and rate limiting
+        // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
+        const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
+          for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+              const response = await fetch(url, {
+                headers: this.getAuthHeaders()
+              });
+
+              if (response.status === 429) {
+                const retryAfter = response.headers.get('Retry-After');
+                const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
+                console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+                new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                continue;
+              }
+
+              if (!response.ok) {
+                throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+              }
+
+              return response;
+            } catch (e) {
+              if (attempt === maxRetries - 1) throw e;
+              const waitTime = Math.pow(2, attempt) * 1000;
+              console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+              await new Promise(resolve => setTimeout(resolve, waitTime));
+            }
+          }
+          throw new Error('Max retries exceeded');
+        };
+
+        try {
+          // Fetch all book IDs from Readwise API
+          let allApiBooks: any[] = [];
+          let nextUrl: string | null = 'https://readwise.io/api/v2/books/';
+          let pageCount = 0;
+
+          while (nextUrl && pageCount < 100) {
+            pageCount++;
+            const response = await fetchWithRetry(nextUrl);
+
+            const data = await response.json();
+            allApiBooks = allApiBooks.concat(data.results);
+            nextUrl = data.next;
+
+            if (pageCount % 5 === 0) {
+              console.log(`Readwise: Fetched ${allApiBooks.length} items so far...`);
+              new Notice(`Fetched ${allApiBooks.length} items... (page ${pageCount})`, 2000);
+            }
+
+            // Book LIST endpoint limited to 20 requests/minute = 3 seconds between requests
+            if (nextUrl) {
+              await new Promise(resolve => setTimeout(resolve, 3000));
+            }
+          }
+
+          // Build set of tracked book IDs
+          const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
+
+          // Find missing book IDs
+          const missingBookIds = allApiBooks
+            .filter(book => !trackedIds.has(book.id.toString()))
+            .map(book => book.id.toString());
+
+          if (missingBookIds.length === 0) {
+            new Notice('No missing items found!', 5000);
+            return;
+          }
+
+          console.log(`Readwise: Adding ${missingBookIds.length} missing items to refresh queue`);
+
+          // Add to booksToRefresh
+          this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...missingBookIds])];
+          await this.saveSettings();
+
+          new Notice(`Added ${missingBookIds.length} missing items to sync queue. Starting sync...`, 5000);
+
+          // Trigger sync
+          await this.syncBookHighlights();
+
+        } catch (e) {
+          console.error('Readwise: Error resyncing missing items:', e);
+          new Notice(`Error: ${e.message}`, 10000);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-sync-category',
+      name: 'Sync specific category only',
+      callback: async () => {
+        const categoryMap: { [key: string]: string } = {
+          'articles': 'Articles',
+          'books': 'Books',
+          'tweets': 'Tweets',
+          'podcasts': 'Podcasts'
+        };
+
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("Select category to sync");
+        modal.contentEl.createEl('p', {
+          text: 'This will fetch missing items from the selected category only.',
+        });
+
+        const selectContainer = modal.contentEl.createEl('div');
+        const select = selectContainer.createEl('select');
+        Object.entries(categoryMap).forEach(([key, label]) => {
+          select.createEl('option', { text: label, value: key });
+        });
+
+        const buttonsContainer = modal.contentEl.createEl('div', { cls: "rw-modal-btns" });
+        const cancelBtn = buttonsContainer.createEl("button", { text: "Cancel" });
+        const confirmBtn = buttonsContainer.createEl("button", { text: "Sync Category" });
+
+        cancelBtn.onclick = () => modal.close();
+        confirmBtn.onclick = async () => {
+          const selectedCategory = select.value;
+          modal.close();
+
+          new Notice(`Fetching ${categoryMap[selectedCategory]} from Readwise...`, 10000);
+
+          // Helper function to fetch with retry and rate limiting
+          // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
+          const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
+            for (let attempt = 0; attempt < maxRetries; attempt++) {
+              try {
+                const response = await fetch(url, {
+                  headers: this.getAuthHeaders()
+                });
+
+                if (response.status === 429) {
+                  const retryAfter = response.headers.get('Retry-After');
+                  const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
+                  console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+                  new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
+                  await new Promise(resolve => setTimeout(resolve, waitTime));
+                  continue;
+                }
+
+                if (!response.ok) {
+                  throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+                }
+
+                return response;
+              } catch (e) {
+                if (attempt === maxRetries - 1) throw e;
+                const waitTime = Math.pow(2, attempt) * 1000;
+                console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+              }
+            }
+            throw new Error('Max retries exceeded');
+          };
+
+          try {
+            // Fetch all books of this category
+            let categoryBooks: any[] = [];
+            let nextUrl: string | null = `https://readwise.io/api/v2/books/?category=${selectedCategory}`;
+            let pageCount = 0;
+
+            while (nextUrl) {
+              pageCount++;
+              const response = await fetchWithRetry(nextUrl);
+
+              const data = await response.json();
+              categoryBooks = categoryBooks.concat(data.results);
+              nextUrl = data.next;
+
+              if (pageCount % 3 === 0) {
+                console.log(`Readwise: Fetched ${categoryBooks.length} ${selectedCategory}... (page ${pageCount})`);
+                new Notice(`Fetched ${categoryBooks.length} ${selectedCategory}... (page ${pageCount})`, 2000);
+              }
+
+              // Book LIST endpoint limited to 20 requests/minute = 3 seconds between requests
+              if (nextUrl) {
+                await new Promise(resolve => setTimeout(resolve, 3000));
+              }
+            }
+
+            // Find missing ones
+            const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
+            const missingBookIds = categoryBooks
+              .filter(book => !trackedIds.has(book.id.toString()))
+              .map(book => book.id.toString());
+
+            if (missingBookIds.length === 0) {
+              new Notice(`All ${categoryMap[selectedCategory]} are already synced!`, 5000);
+              return;
+            }
+
+            console.log(`Readwise: Found ${missingBookIds.length} missing ${selectedCategory}`);
+
+            // Add to refresh queue and sync
+            this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...missingBookIds])];
+            await this.saveSettings();
+
+            new Notice(`Syncing ${missingBookIds.length} missing ${categoryMap[selectedCategory]}...`, 5000);
+            await this.syncBookHighlights();
+
+          } catch (e) {
+            console.error(`Readwise: Error syncing ${selectedCategory}:`, e);
+            new Notice(`Error: ${e.message}`, 10000);
+          }
+        };
+
+        modal.open();
       }
     });
     this.registerMarkdownPostProcessor((el, ctx) => {
