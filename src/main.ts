@@ -174,7 +174,7 @@ export default class ReadwisePlugin extends Plugin {
    * uses recursion for polling so that it can be awaited. */
   async getExportStatus(statusID: number, buttonContext?: ButtonComponent, _processedArtifactIds?: Set<number>, _unknownStatusCount?: number, _lastBooksExported?: number) {
     if (statusID <= this.settings.lastSavedStatusID) {
-      console.log(`Readwise Official plugin: Already saved data from export ${statusID}`);
+      console.log(`[Readwise-Phillip] Already saved data from export ${statusID}`);
       await this.handleSyncSuccess(buttonContext);
       this.notice("Readwise data is already up to date", false, 4);
       return;
@@ -212,27 +212,27 @@ export default class ReadwisePlugin extends Plugin {
 
         // If UNKNOWN and no progress for 30 seconds, or UNKNOWN persists for 60 seconds total
         if (data.taskStatus === 'UNKNOWN' && (unknownStatusCount >= 60 || (isStuck && unknownStatusCount >= 30))) {
-          console.log(`Readwise Official plugin: UNKNOWN status persisted for ${unknownStatusCount} attempts`);
-          console.log("Readwise Official plugin: data at timeout:", data);
+          console.log(`[Readwise-Phillip] UNKNOWN status persisted for ${unknownStatusCount} attempts`);
+          console.log("[Readwise-Phillip] data at timeout:", data);
 
           // Check if export is actually complete
           const isComplete = data.isFinished || (data.booksExported && data.totalBooks && data.booksExported >= data.totalBooks);
 
           if (isComplete) {
-            console.log("Readwise Official plugin: Export appears complete despite UNKNOWN status");
+            console.log("[Readwise-Phillip] Export appears complete despite UNKNOWN status");
             // Treat as success
             await downloadUnprocessedArtifacts(data.artifactIds);
             await this.acknowledgeSyncCompleted(buttonContext);
             await this.handleSyncSuccess(buttonContext, "Synced!", statusID);
             this.notice("Readwise sync completed", true, 1, true);
-            console.log("Readwise Official plugin: completed sync");
+            console.log("[Readwise-Phillip] completed sync");
             // @ts-ignore
             if (this.app.isMobile) {
               this.notice("If you don't see all of your Readwise files, please reload the Obsidian app", true,);
             }
             return;
           } else {
-            console.log("Readwise Official plugin: Export appears incomplete, treating as error");
+            console.log("[Readwise-Phillip] Export appears incomplete, treating as error");
             await this.handleSyncError(buttonContext, "Sync timed out with UNKNOWN status");
             return;
           }
@@ -241,7 +241,7 @@ export default class ReadwisePlugin extends Plugin {
         if (WAITING_STATUSES.includes(data.taskStatus) || data.taskStatus === 'UNKNOWN') {
           if (data.taskStatus === 'UNKNOWN') {
             const progressInfo = isStuck ? ` - STUCK at ${currentBooksExported}/${data.totalBooks}` : ` - progressing (${currentBooksExported}/${data.totalBooks})`;
-            console.log(`Readwise Official plugin: UNKNOWN status encountered (attempt ${newUnknownCount}/60)${progressInfo}`);
+            console.log(`[Readwise-Phillip] UNKNOWN status encountered (attempt ${newUnknownCount}/60)${progressInfo}`);
           }
           if (data.booksExported) {
             const progressMsg = `Exporting Readwise data (${data.booksExported} / ${data.totalBooks}) ...`;
@@ -262,23 +262,23 @@ export default class ReadwisePlugin extends Plugin {
           await this.acknowledgeSyncCompleted(buttonContext);
           await this.handleSyncSuccess(buttonContext, "Synced!", statusID);
           this.notice("Readwise sync completed", true, 1, true);
-          console.log("Readwise Official plugin: completed sync");
+          console.log("[Readwise-Phillip] completed sync");
           // @ts-ignore
           if (this.app.isMobile) {
             this.notice("If you don't see all of your Readwise files, please reload the Obsidian app", true,);
 
           }
         } else {
-          console.log("Readwise Official plugin: unexpected status in getExportStatus: ", data);
+          console.log("[Readwise-Phillip] unexpected status in getExportStatus: ", data);
           await this.handleSyncError(buttonContext, "Sync failed - unexpected status: " + data.taskStatus);
           return;
         }
       } else {
-        console.log("Readwise Official plugin: bad response in getExportStatus: ", response);
+        console.log("[Readwise-Phillip] bad response in getExportStatus: ", response);
         await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       }
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed in getExportStatus: ", e);
+      console.log("[Readwise-Phillip] fetch failed in getExportStatus: ", e);
       await this.handleSyncError(buttonContext, "Sync failed");
     }
   }
@@ -290,7 +290,7 @@ export default class ReadwisePlugin extends Plugin {
       return;
     }
 
-    console.log('Readwise Official plugin: requesting archive...');
+    console.log('[Readwise-Phillip] requesting archive...');
     this.settings.isSyncing = true;
     await this.saveSettings();
 
@@ -313,7 +313,7 @@ export default class ReadwisePlugin extends Plugin {
         }
       );
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed in queueExport: ", e);
+      console.log("[Readwise-Phillip] fetch failed in queueExport: ", e);
     }
 
     if (response && response.ok) {
@@ -328,18 +328,18 @@ export default class ReadwisePlugin extends Plugin {
       // save the sync status ID so it can be polled until the archive is ready
       this.settings.currentSyncStatusID = data.latest_id;
       await this.saveSettings();
-      console.log("Readwise Official plugin: saved currentSyncStatusID", this.settings.currentSyncStatusID);
+      console.log("[Readwise-Phillip] saved currentSyncStatusID", this.settings.currentSyncStatusID);
 
       if (response.status === 201) {
         this.notice("Syncing Readwise data");
         await this.getExportStatus(this.settings.currentSyncStatusID, buttonContext);
-        console.log('Readwise Official plugin: queueExport done');
+        console.log('[Readwise-Phillip] queueExport done');
       } else {
         await this.handleSyncSuccess(buttonContext, "Synced", data.latest_id);
         this.notice("Latest Readwise sync already happened on your other device. Data should be up to date", false, 4, true);
       }
     } else {
-      console.log("Readwise Official plugin: bad response in queueExport: ", response);
+      console.log("[Readwise-Phillip] bad response in queueExport: ", response);
       await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       return;
     }
@@ -388,12 +388,12 @@ export default class ReadwisePlugin extends Plugin {
         artifactURL, { headers: this.getAuthHeaders() }
       );
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed in downloadExport: ", e);
+      console.log("[Readwise-Phillip] fetch failed in downloadExport: ", e);
     }
     if (response && response.ok) {
       blob = await response.blob();
     } else {
-      console.log("Readwise Official plugin: bad response in downloadExport: ", response);
+      console.log("[Readwise-Phillip] bad response in downloadExport: ", response);
       await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       throw new Error(`Readwise: error while fetching artifact ${artifactId}`);
     }
@@ -480,7 +480,7 @@ export default class ReadwisePlugin extends Plugin {
           // the user has `settings.refreshBooks` enabled
           if (bookID) await this.saveSettings();
         } catch (e) {
-          console.log(`Readwise Official plugin: error writing ${processedFileName}:`, e);
+          console.log(`[Readwise-Phillip] error writing ${processedFileName}:`, e);
           this.notice(`Readwise: error while writing ${processedFileName}: ${e}`, true, 4, true);
           if (bookID) {
             // handles case where user doesn't have `settings.refreshBooks` enabled
@@ -504,17 +504,17 @@ export default class ReadwisePlugin extends Plugin {
     // wait for the metadata cache to process created/updated documents
     await new Promise<void>((resolve) => {
       const timeoutSeconds = 15;
-      console.log(`Readwise Official plugin: waiting for metadata cache processing for up to ${timeoutSeconds}s...`)
+      console.log(`[Readwise-Phillip] waiting for metadata cache processing for up to ${timeoutSeconds}s...`)
       const timeout = setTimeout(() => {
         this.app.metadataCache.offref(eventRef);
-        console.log("Readwise Official plugin: metadata cache processing timeout reached.");
+        console.log("[Readwise-Phillip] metadata cache processing timeout reached.");
         resolve();
       }, timeoutSeconds * 1000);
 
       const eventRef = this.app.metadataCache.on("resolved", () => {
         this.app.metadataCache.offref(eventRef);
         clearTimeout(timeout);
-        console.log("Readwise Official plugin: metadata cache processing has finished.");
+        console.log("[Readwise-Phillip] metadata cache processing has finished.");
         resolve();
       });
     });
@@ -530,12 +530,12 @@ export default class ReadwisePlugin extends Plugin {
           method: "POST",
         });
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed to acknowledged sync: ", e);
+      console.log("[Readwise-Phillip] fetch failed to acknowledged sync: ", e);
     }
     if (response && response.ok) {
       return;
     } else {
-      console.log("Readwise Official plugin: bad response in acknowledge sync: ", response);
+      console.log("[Readwise-Phillip] bad response in acknowledge sync: ", response);
       await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       return;
     }
@@ -736,7 +736,7 @@ export default class ReadwisePlugin extends Plugin {
   async configureSchedule() {
     const minutes = parseInt(this.settings.frequency);
     let milliseconds = minutes * 60 * 1000; // minutes * seconds * milliseconds
-    console.log('Readwise Official plugin: setting interval to ', milliseconds, 'milliseconds');
+    console.log('[Readwise-Phillip] setting interval to ', milliseconds, 'milliseconds');
     window.clearInterval(this.scheduleInterval);
     this.scheduleInterval = null;
     if (!milliseconds) {
@@ -775,14 +775,14 @@ export default class ReadwisePlugin extends Plugin {
     }
 
     if (!targetBookIds.length) {
-      console.log('Readwise Official plugin: no targetBookIds, checking for new highlights');
+      console.log('[Readwise-Phillip] no targetBookIds, checking for new highlights');
       // no need to hit refresh_book_export;
       // just check if there's new highlights from the server
       await this.queueExport();
       return;
     }
 
-    console.log('Readwise Official plugin: refreshing books', { targetBookIds });
+    console.log('[Readwise-Phillip] refreshing books', { targetBookIds });
 
     let requestBookIds: string[] = [];
     let requestReaderDocumentIds: string[] = [];
@@ -817,14 +817,14 @@ export default class ReadwisePlugin extends Plugin {
         await this.queueExport();
         return;
       } else {
-        console.log(`Readwise Official plugin: saving book id ${bookIds} to refresh later`);
+        console.log(`[Readwise-Phillip] saving book id ${bookIds} to refresh later`);
         const deduplicatedBookIds = new Set([...this.settings.booksToRefresh, ...bookIds]);
         this.settings.booksToRefresh = Array.from(deduplicatedBookIds);
         await this.saveSettings();
         return;
       }
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed in syncBookHighlights: ", e);
+      console.log("[Readwise-Phillip] fetch failed in syncBookHighlights: ", e);
     }
   }
 
@@ -833,7 +833,7 @@ export default class ReadwisePlugin extends Plugin {
     // so not all users may have it, hence the fallback to DEFAULT_SETTINGS.failedBooks
     let failedBooks = [...(this.settings.failedBooks || DEFAULT_SETTINGS.failedBooks)];
     failedBooks.push(bookId);
-    console.log(`Readwise Official plugin: added book id ${bookId} to failed books`);
+    console.log(`[Readwise-Phillip] added book id ${bookId} to failed books`);
     this.settings.failedBooks = failedBooks;
 
     // don't forget to save after!
@@ -843,7 +843,7 @@ export default class ReadwisePlugin extends Plugin {
   async addBookToRefresh(bookId: string) {
     let booksToRefresh = [...this.settings.booksToRefresh];
     booksToRefresh.push(bookId);
-    console.log(`Readwise Official plugin: added book id ${bookId} to refresh list`);
+    console.log(`[Readwise-Phillip] added book id ${bookId} to refresh list`);
     this.settings.booksToRefresh = booksToRefresh;
     await this.saveSettings();
   }
@@ -851,7 +851,7 @@ export default class ReadwisePlugin extends Plugin {
   async removeBooksFromRefresh(bookIds: Array<string> = []) {
     if (!bookIds.length) return;
 
-    console.log(`Readwise Official plugin: removing book ids ${bookIds.join(', ')} from refresh list`);
+    console.log(`[Readwise-Phillip] removing book ids ${bookIds.join(', ')} from refresh list`);
     this.settings.booksToRefresh = this.settings.booksToRefresh.filter(n => !bookIds.includes(n));
 
     // don't forget to save after!
@@ -861,7 +861,7 @@ export default class ReadwisePlugin extends Plugin {
   async removeBookFromFailedBooks(bookIds: Array<string> = []) {
     if (!bookIds.length) return;
 
-    console.log(`Readwise Official plugin: removing book ids ${bookIds.join(', ')} from failed list`);
+    console.log(`[Readwise-Phillip] removing book ids ${bookIds.join(', ')} from failed list`);
     this.settings.failedBooks = this.settings.failedBooks.filter(n => !bookIds.includes(n));
 
     // don't forget to save after!
@@ -879,7 +879,7 @@ export default class ReadwisePlugin extends Plugin {
       // because the user may have `settings.refreshBooks` disabled
       await this.syncBookHighlights([bookId]);
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed in Reimport current file: ", e);
+      console.log("[Readwise-Phillip] fetch failed in Reimport current file: ", e);
     }
   }
 
@@ -1858,25 +1858,25 @@ export default class ReadwisePlugin extends Plugin {
         `${baseURL}/api/auth?token=${uuid}`
       );
     } catch (e) {
-      console.log("Readwise Official plugin: fetch failed in getUserAuthToken: ", e);
+      console.log("[Readwise-Phillip] fetch failed in getUserAuthToken: ", e);
     }
     if (response && response.ok) {
       data = await response.json();
     } else {
-      console.log("Readwise Official plugin: bad response in getUserAuthToken: ", response);
+      console.log("[Readwise-Phillip] bad response in getUserAuthToken: ", response);
       this.showInfoStatus(button.parentElement, "Authorization failed. Try again", "rw-error");
       return;
     }
     if (data.userAccessToken) {
-      console.log("Readwise Official plugin: successfully authenticated with Readwise");
+      console.log("[Readwise-Phillip] successfully authenticated with Readwise");
       this.settings.token = data.userAccessToken;
       await this.saveSettings();
     } else {
       if (attempt > 20) {
-        console.log('Readwise Official plugin: reached attempt limit in getUserAuthToken');
+        console.log('[Readwise-Phillip] reached attempt limit in getUserAuthToken');
         return;
       }
-      console.log(`Readwise Official plugin: didn't get token data, retrying (attempt ${attempt + 1})`);
+      console.log(`[Readwise-Phillip] didn't get token data, retrying (attempt ${attempt + 1})`);
       await new Promise(resolve => setTimeout(resolve, 1000));
       await this.getUserAuthToken(button, attempt + 1);
     }
