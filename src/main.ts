@@ -173,11 +173,17 @@ export default class ReadwisePlugin extends Plugin {
   /** Polls the Readwise API for the status of a given export;
    * uses recursion for polling so that it can be awaited. */
   async getExportStatus(statusID: number, buttonContext?: ButtonComponent, _processedArtifactIds?: Set<number>, _unknownStatusCount?: number, _lastBooksExported?: number) {
-    if (statusID <= this.settings.lastSavedStatusID) {
+    const hasItemsToRefresh = this.settings.booksToRefresh.length > 0 || this.settings.failedBooks.length > 0;
+
+    if (statusID <= this.settings.lastSavedStatusID && !hasItemsToRefresh) {
       console.log(`[Readwise-Phillip] Already saved data from export ${statusID}`);
       await this.handleSyncSuccess(buttonContext);
       this.notice("Readwise data is already up to date", false, 4);
       return;
+    }
+
+    if (statusID <= this.settings.lastSavedStatusID && hasItemsToRefresh) {
+      console.log(`[Readwise-Phillip] Export ${statusID} already saved, but forcing download for ${this.settings.booksToRefresh.length} queued items`);
     }
     const processedArtifactIds = _processedArtifactIds ?? new Set();
     const unknownStatusCount = _unknownStatusCount ?? 0;
@@ -352,8 +358,19 @@ export default class ReadwisePlugin extends Plugin {
         await this.getExportStatus(this.settings.currentSyncStatusID, buttonContext);
         console.log('[Readwise-Phillip] queueExport done');
       } else {
-        await this.handleSyncSuccess(buttonContext, "Synced", data.latest_id);
-        this.notice("Latest Readwise sync already happened on your other device. Data should be up to date", false, 4, true);
+        // Status 200 - export already exists
+        // But if we have items queued for refresh, we should still download to get them
+        const hasItemsToRefresh = this.settings.booksToRefresh.length > 0 || this.settings.failedBooks.length > 0;
+
+        if (hasItemsToRefresh) {
+          console.log(`[Readwise-Phillip] Export exists but we have ${this.settings.booksToRefresh.length} books to refresh and ${this.settings.failedBooks.length} failed books - forcing download`);
+          this.notice("Downloading refreshed items...");
+          await this.getExportStatus(this.settings.currentSyncStatusID, buttonContext);
+          console.log('[Readwise-Phillip] queueExport done');
+        } else {
+          await this.handleSyncSuccess(buttonContext, "Synced", data.latest_id);
+          this.notice("Latest Readwise sync already happened on your other device. Data should be up to date", false, 4, true);
+        }
       }
     } else {
       console.log("[Readwise-Phillip] bad response in queueExport: ", response);
@@ -424,6 +441,16 @@ export default class ReadwisePlugin extends Plugin {
 
   async downloadArtifact(artifactId: number, buttonContext: ButtonComponent): Promise<void> {
     console.log(`[Readwise-Phillip] downloadArtifact: Starting download of artifact ${artifactId}`);
+
+    // Check if we're doing a targeted refresh
+    const hasTargetedRefresh = this.settings.booksToRefresh.length > 0 || this.settings.failedBooks.length > 0;
+    const targetBookIds = new Set([...this.settings.booksToRefresh, ...this.settings.failedBooks]);
+
+    if (hasTargetedRefresh) {
+      console.log(`[Readwise-Phillip] downloadArtifact: Targeted refresh for ${targetBookIds.size} specific items`);
+      console.log(`[Readwise-Phillip] downloadArtifact: Target IDs:`, Array.from(targetBookIds));
+    }
+
     // download archive from this endpoint
     let artifactURL = `${baseURL}/api/v2/download_artifact/${artifactId}`;
 
@@ -449,9 +476,14 @@ export default class ReadwisePlugin extends Plugin {
     const zipReader = new zip.ZipReader(blobReader);
     const entries = await zipReader.getEntries();
     console.log(`[Readwise-Phillip] downloadArtifact: Artifact ${artifactId} contains ${entries.length} entries`);
+
+    const foundTargetIds = new Set<string>();
+    const allBookIdsInArtifact: string[] = [];
+    let processedCount = 0;
+    let skippedCount = 0;
+
     if (entries.length) {
       for (const entry of entries) {
-        console.log(`[Readwise-Phillip] downloadArtifact: Processing entry: ${entry.filename}`);
         // will be extracted from JSON data
         let bookID: string;
         let data: Record<string, any>;
@@ -476,7 +508,23 @@ export default class ReadwisePlugin extends Plugin {
           }
 
           bookID = this.encodeReadwiseBookId(data.book_id) || this.encodeReaderDocumentId(data.reader_document_id);
-          console.log(`[Readwise-Phillip] downloadArtifact: Extracted bookID: ${bookID} from entry ${entry.filename}`);
+
+          // Track all book IDs in artifact for diagnostic purposes
+          if (bookID && hasTargetedRefresh) {
+            allBookIdsInArtifact.push(bookID);
+          }
+
+          // If doing targeted refresh, skip entries not in target list
+          if (hasTargetedRefresh && bookID && !targetBookIds.has(bookID)) {
+            skippedCount++;
+            continue; // Skip this entry entirely
+          }
+
+          // Track if this is one of our target items
+          if (hasTargetedRefresh && bookID && targetBookIds.has(bookID)) {
+            foundTargetIds.add(bookID);
+            console.log(`[Readwise-Phillip] downloadArtifact: ✓ FOUND TARGET ITEM - bookID: ${bookID} from entry ${entry.filename}`);
+          }
 
           const undefinedBook = !bookID || !processedFileName;
           if (undefinedBook && !isReadwiseSyncFile) {
@@ -488,6 +536,8 @@ export default class ReadwisePlugin extends Plugin {
           if (bookID && !isReadwiseSyncFile) {
             finalProcessedFileName = this.resolveFilenameCollision(processedFileName, bookID);
           }
+
+          processedCount++;
 
           // write the full document text file
           if (data.full_document_text && data.full_document_text_path) {
@@ -563,6 +613,27 @@ export default class ReadwisePlugin extends Plugin {
       }
       await this.saveSettings();
     }
+
+    // Summary logging for targeted refresh
+    if (hasTargetedRefresh) {
+      console.log(`[Readwise-Phillip] downloadArtifact SUMMARY for artifact ${artifactId}:`);
+      console.log(`[Readwise-Phillip]   Total entries in artifact: ${entries.length}`);
+      console.log(`[Readwise-Phillip]   Processed (target items): ${processedCount}`);
+      console.log(`[Readwise-Phillip]   Skipped (not in target list): ${skippedCount}`);
+      console.log(`[Readwise-Phillip]   Target items found: ${foundTargetIds.size} of ${targetBookIds.size}`);
+
+      if (foundTargetIds.size > 0) {
+        console.log(`[Readwise-Phillip]   Found IDs:`, Array.from(foundTargetIds));
+      }
+
+      const missingTargetIds = Array.from(targetBookIds).filter(id => !foundTargetIds.has(id));
+      if (missingTargetIds.length > 0) {
+        console.log(`[Readwise-Phillip]   ⚠️ NOT FOUND in this artifact:`, missingTargetIds);
+        console.log(`[Readwise-Phillip]   Sample of what IS in artifact (first 10):`, allBookIdsInArtifact.slice(0, 10));
+        console.log(`[Readwise-Phillip]   Sample of what IS in artifact (last 10):`, allBookIdsInArtifact.slice(-10));
+      }
+    }
+
     // close the ZipReader
     await zipReader.close();
 
@@ -798,6 +869,118 @@ export default class ReadwisePlugin extends Plugin {
     }
   }
 
+  /** Fetch and save highlights for specific book IDs directly via API.
+   * Bypasses export system for faster targeted refresh. */
+  async syncSpecificBooksDirect(bookIds: string[]): Promise<{ success: number, failed: string[] }> {
+    console.log(`[Readwise-Phillip] syncSpecificBooksDirect: Syncing ${bookIds.length} books via direct API`);
+
+    const results = { success: 0, failed: [] as string[] };
+
+    for (const bookId of bookIds) {
+      try {
+        console.log(`[Readwise-Phillip] syncSpecificBooksDirect: Fetching book ${bookId}`);
+
+        // Fetch book metadata
+        const bookResponse = await fetch(`${baseURL}/api/v2/books/${bookId}/`, {
+          headers: this.getAuthHeaders()
+        });
+
+        if (!bookResponse.ok) {
+          console.error(`[Readwise-Phillip] Failed to fetch book ${bookId}: ${bookResponse.status}`);
+          results.failed.push(bookId);
+          continue;
+        }
+
+        const book = await bookResponse.json();
+        console.log(`[Readwise-Phillip] Book ${bookId}: "${book.title}" (${book.category}), ${book.num_highlights} highlights`);
+
+        // Skip if no highlights
+        if (book.num_highlights === 0) {
+          console.log(`[Readwise-Phillip] Skipping book ${bookId} - no highlights`);
+          results.failed.push(bookId);
+          continue;
+        }
+
+        // Fetch highlights
+        const highlightsResponse = await fetch(`${baseURL}/api/v2/books/${bookId}/highlights/`, {
+          headers: this.getAuthHeaders()
+        });
+
+        const category = book.category.charAt(0).toUpperCase() + book.category.slice(1);
+        let content = `# ${book.title}\n\n`;
+        content += `**Author:** ${book.author || 'Unknown'}\n`;
+        content += `**Category:** ${book.category}\n`;
+        if (book.source_url) {
+          content += `**Source:** ${book.source_url}\n`;
+        }
+        content += `\n---\n\n`;
+
+        if (!highlightsResponse.ok) {
+          console.error(`[Readwise-Phillip] Failed to fetch highlights for book ${bookId}: ${highlightsResponse.status}`);
+
+          // Create stub file documenting the failure
+          content += `## ⚠️ Sync Error\n\n`;
+          content += `**Status:** Failed to sync highlights from Readwise API\n\n`;
+          content += `**Error:** API returned ${highlightsResponse.status} (${highlightsResponse.statusText})\n\n`;
+          content += `**Book ID:** ${bookId}\n\n`;
+          content += `**Expected Highlights:** ${book.num_highlights}\n\n`;
+          content += `**Details:**\n`;
+          content += `- The Readwise API reports this book has ${book.num_highlights} highlight(s)\n`;
+          content += `- However, the highlights endpoint returned a 404 error\n`;
+          content += `- This indicates a server-side data issue with this book\n\n`;
+          content += `**What you can do:**\n`;
+          content += `1. Try viewing this book on readwise.io/library to see if highlights appear there\n`;
+          content += `2. Contact Readwise support about book ID ${bookId} if highlights are missing\n`;
+          content += `3. If highlights appear on the website, try deleting this file and re-syncing\n`;
+          content += `4. This file was created as a placeholder to prevent continuous "missing item" errors\n\n`;
+          content += `**Sync Attempted:** ${new Date().toISOString()}\n`;
+
+          console.log(`[Readwise-Phillip] Creating stub file for inaccessible book ${bookId}`);
+        } else {
+          const highlightsData = await highlightsResponse.json();
+          const highlights = highlightsData.results;
+
+          console.log(`[Readwise-Phillip] Fetched ${highlights.length} highlights for book ${bookId}`);
+
+          // Add highlights
+          highlights.forEach((highlight: any) => {
+            content += `## ${highlight.text}\n\n`;
+            if (highlight.note) {
+              content += `**Note:** ${highlight.note}\n\n`;
+            }
+            if (highlight.tags && highlight.tags.length > 0) {
+              content += `**Tags:** ${highlight.tags.map((t: any) => t.name).join(', ')}\n\n`;
+            }
+            content += `---\n\n`;
+          });
+        }
+
+        // Save file
+        const fileName = `${this.settings.readwiseDir}/${category}/${book.title}.md`;
+        const finalFileName = this.resolveFilenameCollision(fileName, bookId);
+
+        await this.createDirForFile(finalFileName);
+        await this.app.vault.adapter.write(finalFileName, content);
+
+        // Track in booksIDsMap
+        this.settings.booksIDsMap[finalFileName] = bookId;
+
+        console.log(`[Readwise-Phillip] ✓ Saved book ${bookId} to ${finalFileName}`);
+        results.success++;
+
+      } catch (e) {
+        console.error(`[Readwise-Phillip] Error syncing book ${bookId}:`, e);
+        results.failed.push(bookId);
+      }
+
+      // Rate limiting: 20 requests per minute = 3 seconds between requests
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+
+    await this.saveSettings();
+    return results;
+  }
+
   async configureSchedule() {
     const minutes = parseInt(this.settings.frequency);
     let milliseconds = minutes * 60 * 1000; // minutes * seconds * milliseconds
@@ -887,7 +1070,9 @@ export default class ReadwisePlugin extends Plugin {
       );
 
       if (response && response.ok) {
-        console.log("[Readwise-Phillip] Response OK, await queueExport()");
+        const responseData = await response.json();
+        console.log("[Readwise-Phillip] Response OK from refresh_book_export:", responseData);
+        console.log("[Readwise-Phillip] Proceeding to queueExport()");
         await this.queueExport();
         return;
       } else {
@@ -1684,6 +1869,75 @@ export default class ReadwisePlugin extends Plugin {
 
         } catch (e) {
           console.error('Readwise: Error resyncing missing items:', e);
+          new Notice(`Error: ${e.message}`, 10000);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-direct-resync',
+      name: 'Direct resync missing items (fast)',
+      callback: async () => {
+        // Check cache
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
+
+        let allApiBooks: any[];
+
+        if (this.booksCache) {
+          const cacheAge = this.getCacheAgeDescription(this.booksCache);
+          new Notice(`Finding missing items from cache (${cacheAge})...`, 5000);
+
+          allApiBooks = Object.values(this.booksCache.byId)
+            .filter(book => book.num_highlights > 0)
+            .map(book => ({
+              id: parseInt(book.id)
+            }));
+        } else {
+          new Notice('No cache. Run "Rebuild book cache" first.', 10000);
+          return;
+        }
+
+        try {
+          // Build set of tracked book IDs
+          const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
+
+          // Find missing book IDs
+          const missingBookIds = allApiBooks
+            .filter(book => !trackedIds.has(book.id.toString()))
+            .map(book => book.id.toString());
+
+          if (missingBookIds.length === 0) {
+            new Notice('No missing items found!', 5000);
+            return;
+          }
+
+          console.log(`[Readwise-Phillip] Direct sync for ${missingBookIds.length} missing items (items with 0 highlights excluded)`);
+
+          new Notice(`Syncing ${missingBookIds.length} items directly via API...`, 5000);
+
+          // Use direct API instead of export system
+          const results = await this.syncSpecificBooksDirect(missingBookIds);
+
+          if (results.success > 0) {
+            new Notice(`✓ Successfully synced ${results.success} items!`, 5000);
+          }
+
+          if (results.failed.length > 0) {
+            new Notice(`⚠️ Failed to sync ${results.failed.length} items. Check console for details.`, 10000);
+            console.error(`[Readwise-Phillip] Failed book IDs:`, results.failed);
+
+            // Add failed items to failedBooks queue
+            this.settings.failedBooks = [...new Set([...this.settings.failedBooks, ...results.failed])];
+            await this.saveSettings();
+          }
+
+          // Clear booksToRefresh since we just synced them
+          this.settings.booksToRefresh = [];
+          await this.saveSettings();
+
+        } catch (e) {
+          console.error('Readwise: Error direct syncing:', e);
           new Notice(`Error: ${e.message}`, 10000);
         }
       }
