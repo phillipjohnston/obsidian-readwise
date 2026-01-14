@@ -11,5 +11,6 @@ main.js
 *.js.map
 
 data.json
+cache.json
 .env
 dist
