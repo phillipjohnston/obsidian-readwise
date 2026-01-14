@@ -183,9 +183,7 @@ export default class ReadwisePlugin extends Plugin {
     const unknownStatusCount = _unknownStatusCount ?? 0;
     const lastBooksExported = _lastBooksExported ?? 0;
     const downloadUnprocessedArtifacts = async (allArtifactIds: number[]) => {
-      console.log("[Readwise-Phillip] processing artifacts");
       for (const artifactId of allArtifactIds) {
-        console.log("[Readwise-Phillip] artifact: ", artifactId);
         if (!processedArtifactIds.has(artifactId)) {
           await this.downloadArtifact(artifactId, buttonContext);
           processedArtifactIds.add(artifactId);
@@ -254,8 +252,22 @@ export default class ReadwisePlugin extends Plugin {
           }
           // process any artifacts available while the export is still being generated
           await downloadUnprocessedArtifacts(data.artifactIds);
-          // wait 1 second
-          await new Promise(resolve => setTimeout(resolve, 1000));
+
+          // Intelligent polling interval based on export state
+          let pollInterval = 3000; // Default: 3 seconds
+          if (data.booksExported === 0) {
+            // Initial state - export not started yet
+            pollInterval = 5000; // 5 seconds
+          } else if (data.booksExported > 0 && data.booksExported < data.totalBooks * 0.1) {
+            // Early stage (first 10%)
+            pollInterval = 4000; // 4 seconds
+          } else if (data.booksExported >= data.totalBooks * 0.9) {
+            // Near completion (last 10%)
+            pollInterval = 2000; // 2 seconds - more responsive near end
+          }
+
+          console.log(`[Readwise-Phillip] Waiting ${pollInterval/1000}s before next poll...`);
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
           // then keep polling
           await this.getExportStatus(statusID, buttonContext, processedArtifactIds, newUnknownCount, currentBooksExported);
         } else if (SUCCESS_STATUSES.includes(data.taskStatus)) {
@@ -385,6 +397,31 @@ export default class ReadwisePlugin extends Plugin {
     };
   }
 
+  /** Check if filename collides with existing file tracking a different book ID.
+   * Returns a unique filename by appending book ID if collision detected. */
+  resolveFilenameCollision(baseFilename: string, bookID: string): string {
+    // Check if this exact filename already tracks a different book ID
+    const existingBookID = this.settings.booksIDsMap[baseFilename];
+
+    if (existingBookID && existingBookID !== bookID) {
+      // Collision detected - filename exists and tracks a different book
+      console.log(`[Readwise-Phillip] COLLISION DETECTED: ${baseFilename}`);
+      console.log(`[Readwise-Phillip]   Existing book ID: ${existingBookID}`);
+      console.log(`[Readwise-Phillip]   New book ID: ${bookID}`);
+
+      // Append book ID to make it unique: "Title.md" -> "Title (ID-12345).md"
+      const lastDotIndex = baseFilename.lastIndexOf('.');
+      const nameWithoutExt = baseFilename.substring(0, lastDotIndex);
+      const ext = baseFilename.substring(lastDotIndex);
+      const uniqueFilename = `${nameWithoutExt} (ID-${bookID})${ext}`;
+
+      console.log(`[Readwise-Phillip]   Resolved to: ${uniqueFilename}`);
+      return uniqueFilename;
+    }
+
+    return baseFilename;
+  }
+
   async downloadArtifact(artifactId: number, buttonContext: ButtonComponent): Promise<void> {
     console.log(`[Readwise-Phillip] downloadArtifact: Starting download of artifact ${artifactId}`);
     // download archive from this endpoint
@@ -446,9 +483,17 @@ export default class ReadwisePlugin extends Plugin {
             console.error(`Error while processing entry: ${entry.filename}`);
           }
 
+          // Check for filename collision and resolve before processing
+          let finalProcessedFileName = processedFileName;
+          if (bookID && !isReadwiseSyncFile) {
+            finalProcessedFileName = this.resolveFilenameCollision(processedFileName, bookID);
+          }
+
           // write the full document text file
           if (data.full_document_text && data.full_document_text_path) {
-            const processedFullDocumentTextFileName = data.full_document_text_path.replace(/^Readwise/, this.settings.readwiseDir);
+            let processedFullDocumentTextFileName = data.full_document_text_path.replace(/^Readwise/, this.settings.readwiseDir);
+            // Check for collision and resolve
+            processedFullDocumentTextFileName = this.resolveFilenameCollision(processedFullDocumentTextFileName, bookID);
             console.log(`[Readwise-Phillip] downloadArtifact: Writing full document text for bookID ${bookID}: ${processedFullDocumentTextFileName}`);
             // track the book
             this.settings.booksIDsMap[processedFullDocumentTextFileName] = bookID;
@@ -470,14 +515,14 @@ export default class ReadwisePlugin extends Plugin {
           // write the actual files
           let contentToSave = data.full_content ?? data.append_only_content;
           if (contentToSave) {
-            console.log(`[Readwise-Phillip] downloadArtifact: Writing highlights file for bookID ${bookID}: ${processedFileName}`);
+            console.log(`[Readwise-Phillip] downloadArtifact: Writing highlights file for bookID ${bookID}: ${finalProcessedFileName}`);
             // track the book
-            this.settings.booksIDsMap[processedFileName] = bookID;
+            this.settings.booksIDsMap[finalProcessedFileName] = bookID;
             // ensure the directory exists
-            await this.createDirForFile(processedFileName);
-            if (await this.fs.exists(processedFileName)) {
+            await this.createDirForFile(finalProcessedFileName);
+            if (await this.fs.exists(finalProcessedFileName)) {
               // if the file already exists we need to append content to existing one
-              const existingContent = await this.fs.read(processedFileName);
+              const existingContent = await this.fs.read(finalProcessedFileName);
               const existingContentHash = Md5.hashStr(existingContent).toString();
               if (existingContentHash !== data.last_content_hash) {
                 // content has been modified (it differs from the previously exported full document)
@@ -489,7 +534,7 @@ export default class ReadwisePlugin extends Plugin {
             } else {
               console.log(`[Readwise-Phillip] downloadArtifact: Creating new file`);
             }
-            await this.fs.write(processedFileName, contentToSave);
+            await this.fs.write(finalProcessedFileName, contentToSave);
             console.log(`[Readwise-Phillip] downloadArtifact: Successfully wrote file for bookID ${bookID}`);
           } else {
             console.log(`[Readwise-Phillip] downloadArtifact: No content to save for bookID ${bookID} (entry: ${entry.filename})`);
@@ -500,8 +545,8 @@ export default class ReadwisePlugin extends Plugin {
           // the user has `settings.refreshBooks` enabled
           if (bookID) await this.saveSettings();
         } catch (e) {
-          console.log(`[Readwise-Phillip] error writing ${processedFileName}:`, e);
-          this.notice(`Readwise: error while writing ${processedFileName}: ${e}`, true, 4, true);
+          console.log(`[Readwise-Phillip] error writing ${finalProcessedFileName}:`, e);
+          this.notice(`Readwise: error while writing ${finalProcessedFileName}: ${e}`, true, 4, true);
           if (bookID) {
             // handles case where user doesn't have `settings.refreshBooks` enabled
             await this.addToFailedBooks(bookID);
@@ -862,7 +907,7 @@ export default class ReadwisePlugin extends Plugin {
     // so not all users may have it, hence the fallback to DEFAULT_SETTINGS.failedBooks
     let failedBooks = [...(this.settings.failedBooks || DEFAULT_SETTINGS.failedBooks)];
     failedBooks.push(bookId);
-    console.log(`[Readwise-Phillip] added book id ${bookId} to failed books`);
+    //console.log(`[Readwise-Phillip] added book id ${bookId} to failed books`);
     this.settings.failedBooks = failedBooks;
 
     // don't forget to save after!
@@ -872,7 +917,7 @@ export default class ReadwisePlugin extends Plugin {
   async addBookToRefresh(bookId: string) {
     let booksToRefresh = [...this.settings.booksToRefresh];
     booksToRefresh.push(bookId);
-    console.log(`[Readwise-Phillip] added book id ${bookId} to refresh list`);
+    //console.log(`[Readwise-Phillip] added book id ${bookId} to refresh list`);
     this.settings.booksToRefresh = booksToRefresh;
     await this.saveSettings();
   }
@@ -1802,6 +1847,251 @@ export default class ReadwisePlugin extends Plugin {
         }
 
         new Notice('Cache statistics generated', 5000);
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-detect-collisions',
+      name: 'Detect filename collisions',
+      callback: async () => {
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
+
+        if (!this.booksCache) {
+          new Notice('No cache available. Run "Rebuild book cache" first.', 5000);
+          return;
+        }
+
+        new Notice('Analyzing filename collisions...', 5000);
+
+        // Build map of titles to book IDs
+        const titleToBooks: { [title: string]: Array<{ id: string, category: string, tracked: boolean }> } = {};
+
+        Object.values(this.booksCache.byId).forEach(book => {
+          if (book.num_highlights === 0) return; // Skip 0-highlight items
+
+          const title = book.title.trim();
+          if (!titleToBooks[title]) {
+            titleToBooks[title] = [];
+          }
+
+          const isTracked = Object.values(this.settings.booksIDsMap).includes(book.id);
+          titleToBooks[title].push({
+            id: book.id,
+            category: book.category,
+            tracked: isTracked
+          });
+        });
+
+        // Find titles with duplicates
+        const collisions = Object.entries(titleToBooks)
+          .filter(([_, books]) => books.length > 1)
+          .sort((a, b) => b[1].length - a[1].length);
+
+        // Generate report
+        let report = '# Filename Collision Report\n\n';
+        report += `**Generated:** ${new Date().toISOString()}\n\n`;
+        report += `**Total titles with collisions:** ${collisions.length}\n`;
+        report += `**Total duplicate items:** ${collisions.reduce((sum, [_, books]) => sum + books.length, 0)}\n\n`;
+
+        report += '## Summary\n\n';
+        report += 'This report identifies items with duplicate titles that map to the same filename.\n';
+        report += 'Items marked with ✗ are NOT tracked in booksIDsMap (lost due to collision).\n';
+        report += 'Items marked with ✓ ARE tracked (but may contain merged content from duplicates).\n\n';
+
+        // Count by impact
+        const withMissing = collisions.filter(([_, books]) => books.some(b => !b.tracked));
+        const allTracked = collisions.filter(([_, books]) => books.every(b => b.tracked));
+
+        report += `**Collisions with lost tracking:** ${withMissing.length}\n`;
+        report += `**Collisions where all items tracked:** ${allTracked.length} (files may contain merged content)\n\n`;
+
+        report += '## Collisions with Lost Tracking\n\n';
+        report += 'These collisions have items that are NOT tracked in booksIDsMap:\n\n';
+
+        withMissing.forEach(([title, books]) => {
+          report += `### ${title}\n\n`;
+          books.forEach(book => {
+            const status = book.tracked ? '✓' : '✗';
+            report += `- ${status} **${book.category}** - ID: \`${book.id}\`${book.tracked ? '' : ' ⚠️ NOT TRACKED'}\n`;
+          });
+          report += '\n';
+        });
+
+        if (allTracked.length > 0) {
+          report += '## Collisions with All Items Tracked\n\n';
+          report += 'These items all appear tracked, but files may contain merged content from multiple sources:\n\n';
+
+          allTracked.slice(0, 20).forEach(([title, books]) => {
+            report += `### ${title}\n\n`;
+            books.forEach(book => {
+              report += `- ✓ **${book.category}** - ID: \`${book.id}\`\n`;
+            });
+            report += '\n';
+          });
+
+          if (allTracked.length > 20) {
+            report += `... and ${allTracked.length - 20} more\n\n`;
+          }
+        }
+
+        report += '## Recommended Actions\n\n';
+        report += '1. **Review collisions** - Identify which items you want to keep\n';
+        report += '2. **Delete collision files** - Remove files with duplicate titles from your vault\n';
+        report += '3. **Resync** - Run "Force resync missing items" to download with unique filenames\n';
+        report += '4. The plugin will now append book IDs to prevent future collisions\n';
+
+        const reportFile = `${this.settings.readwiseDir}/Collision-Report-${Date.now()}.md`;
+        await this.app.vault.create(reportFile, report);
+        const file = this.app.vault.getAbstractFileByPath(reportFile);
+        if (file) {
+          // @ts-ignore
+          await this.app.workspace.getLeaf().openFile(file);
+        }
+
+        new Notice(`Found ${collisions.length} filename collisions. Report created.`, 5000);
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-fix-collisions',
+      name: 'Fix filename collisions (delete and resync)',
+      callback: async () => {
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
+
+        if (!this.booksCache) {
+          new Notice('No cache available. Run "Rebuild book cache" first.', 5000);
+          return;
+        }
+
+        new Notice('Analyzing collisions...', 3000);
+
+        // Build map of titles to book IDs (same logic as detect command)
+        const titleToBooks: { [title: string]: Array<{ id: string, category: string, title: string }> } = {};
+
+        Object.values(this.booksCache.byId).forEach(book => {
+          if (book.num_highlights === 0) return;
+
+          const title = book.title.trim();
+          if (!titleToBooks[title]) {
+            titleToBooks[title] = [];
+          }
+
+          const isTracked = Object.values(this.settings.booksIDsMap).includes(book.id);
+          titleToBooks[title].push({
+            id: book.id,
+            category: book.category,
+            title: book.title
+          });
+        });
+
+        // Find titles with duplicates
+        const collisions = Object.entries(titleToBooks)
+          .filter(([_, books]) => books.length > 1);
+
+        if (collisions.length === 0) {
+          new Notice('No collisions found!', 5000);
+          return;
+        }
+
+        // Find all files that correspond to collision titles
+        const filesToDelete: string[] = [];
+        const bookIDsToResync: string[] = [];
+
+        for (const [title, books] of collisions) {
+          // For each collision, we need to find the corresponding file(s)
+          for (const book of books) {
+            // Build the expected filename for this book
+            const categoryFolder = book.category.charAt(0).toUpperCase() + book.category.slice(1);
+            const expectedFilename = `${this.settings.readwiseDir}/${categoryFolder}/${title}.md`;
+
+            // Check if this file exists in booksIDsMap
+            const trackedBookID = this.settings.booksIDsMap[expectedFilename];
+
+            if (trackedBookID) {
+              // This file exists - mark it for deletion
+              if (!filesToDelete.includes(expectedFilename)) {
+                filesToDelete.push(expectedFilename);
+              }
+            }
+
+            // Add all book IDs from this collision to resync list
+            if (!bookIDsToResync.includes(book.id)) {
+              bookIDsToResync.push(book.id);
+            }
+          }
+        }
+
+        // Show confirmation modal
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("Fix Filename Collisions");
+
+        modal.contentEl.createEl('p', {
+          text: `Found ${collisions.length} filename collisions involving ${bookIDsToResync.length} items.`
+        });
+
+        modal.contentEl.createEl('p', {
+          text: `This will:`
+        });
+
+        const list = modal.contentEl.createEl('ul');
+        list.createEl('li', { text: `Delete ${filesToDelete.length} collision files from your vault` });
+        list.createEl('li', { text: `Remove ${filesToDelete.length} entries from booksIDsMap` });
+        list.createEl('li', { text: `Queue ${bookIDsToResync.length} book IDs for resync` });
+        list.createEl('li', { text: `Files will be recreated with unique names (appending ID if needed)` });
+
+        modal.contentEl.createEl('p', {
+          text: '⚠️ This action cannot be undone. Make sure you have a backup!'
+        });
+
+        const buttonsContainer = modal.contentEl.createEl('div', { cls: "rw-modal-btns" });
+        const cancelBtn = buttonsContainer.createEl("button", { text: "Cancel" });
+        const confirmBtn = buttonsContainer.createEl("button", { text: "Delete and Resync" });
+
+        cancelBtn.onclick = () => modal.close();
+        confirmBtn.onclick = async () => {
+          modal.close();
+          new Notice('Deleting collision files...', 5000);
+
+          let deletedCount = 0;
+          let errorCount = 0;
+
+          // Delete files
+          for (const filePath of filesToDelete) {
+            try {
+              const fileExists = await this.app.vault.adapter.exists(filePath);
+              if (fileExists) {
+                await this.app.vault.adapter.remove(filePath);
+                deletedCount++;
+                console.log(`[Readwise-Phillip] Deleted collision file: ${filePath}`);
+              }
+
+              // Remove from booksIDsMap
+              delete this.settings.booksIDsMap[filePath];
+            } catch (e) {
+              console.error(`[Readwise-Phillip] Error deleting ${filePath}:`, e);
+              errorCount++;
+            }
+          }
+
+          // Save settings
+          await this.saveSettings();
+
+          new Notice(`Deleted ${deletedCount} files. Queueing ${bookIDsToResync.length} items for resync...`, 5000);
+
+          // Add all collision book IDs to refresh queue
+          this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...bookIDsToResync])];
+          await this.saveSettings();
+
+          if (errorCount > 0) {
+            new Notice(`⚠️ ${errorCount} files failed to delete. Check console for details.`, 10000);
+          }
+
+          new Notice(`Ready to resync! Run "Force resync missing items" to download with unique filenames.`, 10000);
+        };
+
+        modal.open();
       }
     });
     this.registerMarkdownPostProcessor((el, ctx) => {
