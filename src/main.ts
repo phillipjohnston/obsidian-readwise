@@ -37,6 +37,30 @@ interface ExportStatusResponse {
   artifactIds: number[],
 }
 
+interface CachedBook {
+  id: string;
+  title: string;
+  author: string;
+  category: string;
+  source_url?: string;
+  num_highlights: number;
+  last_highlight_at?: string;
+  updated_at?: string;
+}
+
+interface ReadwiseBooksCache {
+  version: number;
+  lastUpdated: string;
+  totalBooks: number;
+  byId: { [bookId: string]: CachedBook };
+  byCategory: {
+    articles: string[];
+    books: string[];
+    tweets: string[];
+    podcasts: string[];
+  };
+}
+
 interface ReadwisePluginSettings {
   token: string;
 
@@ -101,6 +125,7 @@ export default class ReadwisePlugin extends Plugin {
   vault: Vault;
   scheduleInterval: null | number = null;
   statusBar: StatusBar;
+  booksCache: ReadwiseBooksCache | null = null;
 
   getErrorMessageFromResponse(response: Response) {
     if (response && response.status === 409) {
@@ -516,6 +541,198 @@ export default class ReadwisePlugin extends Plugin {
     }
   }
 
+  getCachePath(): string {
+    // @ts-ignore - accessing private property
+    return `${this.manifest.dir}/cache.json`;
+  }
+
+  async loadBooksCache(): Promise<ReadwiseBooksCache | null> {
+    try {
+      const cachePath = this.getCachePath();
+      const cacheExists = await this.app.vault.adapter.exists(cachePath);
+      if (!cacheExists) {
+        return null;
+      }
+
+      const cacheData = await this.app.vault.adapter.read(cachePath);
+      const cache = JSON.parse(cacheData) as ReadwiseBooksCache;
+
+      // Validate cache version
+      if (cache.version !== 1) {
+        console.log('Readwise: Cache version mismatch, ignoring cache');
+        return null;
+      }
+
+      console.log(`Readwise: Loaded cache with ${cache.totalBooks} books from ${cache.lastUpdated}`);
+      return cache;
+    } catch (e) {
+      console.error('Readwise: Error loading cache:', e);
+      return null;
+    }
+  }
+
+  async saveBooksCache(cache: ReadwiseBooksCache): Promise<void> {
+    try {
+      const cachePath = this.getCachePath();
+      const cacheData = JSON.stringify(cache, null, 2);
+      await this.app.vault.adapter.write(cachePath, cacheData);
+      console.log(`Readwise: Saved cache with ${cache.totalBooks} books to ${cachePath}`);
+    } catch (e) {
+      console.error('Readwise: Error saving cache:', e);
+    }
+  }
+
+  async clearBooksCache(): Promise<void> {
+    try {
+      const cachePath = this.getCachePath();
+      const cacheExists = await this.app.vault.adapter.exists(cachePath);
+      if (cacheExists) {
+        await this.app.vault.adapter.remove(cachePath);
+        this.booksCache = null;
+        console.log('Readwise: Cache cleared');
+      }
+    } catch (e) {
+      console.error('Readwise: Error clearing cache:', e);
+    }
+  }
+
+  isCacheStale(cache: ReadwiseBooksCache | null): boolean {
+    if (!cache) return true;
+
+    const cacheAge = Date.now() - new Date(cache.lastUpdated).getTime();
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+    return cacheAge > SEVEN_DAYS_MS;
+  }
+
+  getCacheAgeDescription(cache: ReadwiseBooksCache | null): string {
+    if (!cache) return "No cache";
+
+    const cacheDate = new Date(cache.lastUpdated);
+    const ageMs = Date.now() - cacheDate.getTime();
+    const ageDays = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+
+    if (ageDays === 0) return "Today";
+    if (ageDays === 1) return "Yesterday";
+    return `${ageDays} days ago`;
+  }
+
+  async buildBooksCache(showNotices: boolean = true): Promise<ReadwiseBooksCache | null> {
+    if (showNotices) {
+      new Notice('Building book cache from Readwise API...', 10000);
+    }
+
+    const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
+      for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+          const response = await fetch(url, {
+            headers: this.getAuthHeaders()
+          });
+
+          if (response.status === 429) {
+            const retryAfter = response.headers.get('Retry-After');
+            const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
+            console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+            if (showNotices) {
+              new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
+            }
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            continue;
+          }
+
+          if (!response.ok) {
+            throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+          }
+
+          return response;
+        } catch (e) {
+          if (attempt === maxRetries - 1) throw e;
+          const waitTime = Math.pow(2, attempt) * 1000;
+          console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+      }
+      throw new Error('Max retries exceeded');
+    };
+
+    try {
+      let allApiBooks: any[] = [];
+      let nextUrl: string | null = 'https://readwise.io/api/v2/books/';
+      let pageCount = 0;
+
+      while (nextUrl && pageCount < 100) {
+        pageCount++;
+        const response = await fetchWithRetry(nextUrl);
+        const data = await response.json();
+        allApiBooks = allApiBooks.concat(data.results);
+        nextUrl = data.next;
+
+        if (pageCount % 5 === 0 && showNotices) {
+          console.log(`Readwise: Cached ${allApiBooks.length} books... (page ${pageCount})`);
+          new Notice(`Caching books: ${allApiBooks.length} so far...`, 2000);
+        }
+
+        if (nextUrl) {
+          await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+      }
+
+      // Build cache structure
+      const cache: ReadwiseBooksCache = {
+        version: 1,
+        lastUpdated: new Date().toISOString(),
+        totalBooks: allApiBooks.length,
+        byId: {},
+        byCategory: {
+          articles: [],
+          books: [],
+          tweets: [],
+          podcasts: []
+        }
+      };
+
+      // Populate indexes
+      allApiBooks.forEach(book => {
+        const bookId = book.id.toString();
+        const category = book.category || 'articles';
+
+        cache.byId[bookId] = {
+          id: bookId,
+          title: book.title || 'Untitled',
+          author: book.author || 'Unknown',
+          category: category,
+          source_url: book.source_url,
+          num_highlights: book.num_highlights || 0,
+          last_highlight_at: book.last_highlight_at,
+          updated_at: book.updated
+        };
+
+        // Add to category index
+        if (category in cache.byCategory) {
+          cache.byCategory[category as keyof typeof cache.byCategory].push(bookId);
+        }
+      });
+
+      // Save to disk
+      await this.saveBooksCache(cache);
+
+      // Store in memory
+      this.booksCache = cache;
+
+      if (showNotices) {
+        new Notice(`Book cache built successfully: ${cache.totalBooks} books`, 5000);
+      }
+
+      return cache;
+    } catch (e) {
+      console.error('Readwise: Error building cache:', e);
+      if (showNotices) {
+        new Notice(`Error building cache: ${e.message}`, 10000);
+      }
+      return null;
+    }
+  }
+
   async configureSchedule() {
     const minutes = parseInt(this.settings.frequency);
     let milliseconds = minutes * 60 * 1000; // minutes * seconds * milliseconds
@@ -676,6 +893,14 @@ export default class ReadwisePlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+
+    // Load cache into memory (non-blocking)
+    this.loadBooksCache().then(cache => {
+      if (cache) {
+        this.booksCache = cache;
+        console.log(`Readwise: Loaded cache with ${cache.totalBooks} books`);
+      }
+    });
 
     // @ts-expect-error - no type for isMobile
     if (!this.app.isMobile) {
@@ -1085,6 +1310,111 @@ export default class ReadwisePlugin extends Plugin {
       id: 'readwise-official-find-missing',
       name: 'Find and sync missing items',
       callback: async () => {
+        // Check if cache is available
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
+
+        let allApiBooks: any[];
+
+        if (this.booksCache) {
+          // Use cache
+          const cacheAge = this.getCacheAgeDescription(this.booksCache);
+          new Notice(`Using cached book data (${cacheAge}). Run "Rebuild book cache" for fresh data.`, 5000);
+
+          // Convert cache to array format expected by rest of code
+          allApiBooks = Object.values(this.booksCache.byId).map(book => ({
+            id: parseInt(book.id),
+            title: book.title,
+            author: book.author,
+            category: book.category
+          }));
+
+          console.log(`Readwise: Using ${allApiBooks.length} books from cache (${cacheAge})`);
+        } else {
+          // No cache - offer to build it
+          new Notice('No cache found. Building cache from API (this will take a few minutes)...', 10000);
+          const cache = await this.buildBooksCache(true);
+
+          if (!cache) {
+            new Notice('Failed to build cache. Please try again.', 10000);
+            return;
+          }
+
+          allApiBooks = Object.values(cache.byId).map(book => ({
+            id: parseInt(book.id),
+            title: book.title,
+            author: book.author,
+            category: book.category
+          }));
+        }
+
+        try {
+          // Build set of tracked book IDs
+          const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
+          console.log(`Readwise: Currently tracking ${trackedIds.size} items locally`);
+
+          // Find missing items
+          const missingItems = allApiBooks.filter(book => {
+            const bookId = book.id.toString();
+            return !trackedIds.has(bookId);
+          });
+
+          console.log(`Readwise: Found ${missingItems.length} missing items`);
+
+          // Group by category
+          const categoryCounts: { [cat: string]: number } = {};
+          missingItems.forEach(item => {
+            const cat = item.category || 'unknown';
+            categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+          });
+
+          // Create report
+          let report = '# Missing Items Report\n\n';
+          report += `Found **${missingItems.length}** items in Readwise that are not downloaded locally.\n\n`;
+          report += '## Summary by Category\n';
+          Object.entries(categoryCounts).forEach(([cat, count]) => {
+            report += `- ${cat}: ${count} items\n`;
+          });
+          report += '\n## Missing Items (first 50)\n';
+          missingItems.slice(0, 50).forEach(item => {
+            report += `- [${item.category}] ${item.title} by ${item.author} (ID: ${item.id})\n`;
+          });
+          if (missingItems.length > 50) {
+            report += `\n... and ${missingItems.length - 50} more\n`;
+          }
+
+          report += '\n## Next Steps\n';
+          if (missingItems.length > 0) {
+            report += 'Options to sync these items:\n';
+            report += '1. Run "Force resync missing items" command to add them to refresh queue\n';
+            report += '2. Use recovery script to reset lastSavedStatusID and do a full resync\n';
+          } else {
+            report += 'All items from Readwise are downloaded! ✓\n';
+          }
+
+          console.log(report);
+          new Notice(`Found ${missingItems.length} missing items. Report created.`, 10000);
+
+          // Save report
+          const reportFile = `${this.settings.readwiseDir}/Readwise-Missing-Items-${Date.now()}.md`;
+          await this.app.vault.create(reportFile, report);
+          const file = this.app.vault.getAbstractFileByPath(reportFile);
+          if (file) {
+            // @ts-ignore
+            await this.app.workspace.getLeaf().openFile(file);
+          }
+
+        } catch (e) {
+          console.error('Readwise: Error finding missing items:', e);
+          new Notice(`Error: ${e.message}`, 10000);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-find-missing-old',
+      name: 'Find and sync missing items (old/slow)',
+      callback: async () => {
         new Notice('Querying Readwise API for all items...', 10000);
         console.log('Readwise: Fetching all items from API...');
 
@@ -1214,66 +1544,35 @@ export default class ReadwisePlugin extends Plugin {
       id: 'readwise-official-force-resync-missing',
       name: 'Force resync missing items',
       callback: async () => {
-        new Notice('Finding missing items to resync...', 10000);
+        // Check cache
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
 
-        // Helper function to fetch with retry and rate limiting
-        // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
-        const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
-          for (let attempt = 0; attempt < maxRetries; attempt++) {
-            try {
-              const response = await fetch(url, {
-                headers: this.getAuthHeaders()
-              });
+        let allApiBooks: any[];
 
-              if (response.status === 429) {
-                const retryAfter = response.headers.get('Retry-After');
-                const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
-                console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
-                new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
-                await new Promise(resolve => setTimeout(resolve, waitTime));
-                continue;
-              }
+        if (this.booksCache) {
+          const cacheAge = this.getCacheAgeDescription(this.booksCache);
+          new Notice(`Finding missing items from cache (${cacheAge})...`, 5000);
 
-              if (!response.ok) {
-                throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-              }
+          allApiBooks = Object.values(this.booksCache.byId).map(book => ({
+            id: parseInt(book.id)
+          }));
+        } else {
+          new Notice('No cache. Building from API (this takes time)...', 10000);
+          const cache = await this.buildBooksCache(true);
 
-              return response;
-            } catch (e) {
-              if (attempt === maxRetries - 1) throw e;
-              const waitTime = Math.pow(2, attempt) * 1000;
-              console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
-              await new Promise(resolve => setTimeout(resolve, waitTime));
-            }
+          if (!cache) {
+            new Notice('Failed to build cache', 10000);
+            return;
           }
-          throw new Error('Max retries exceeded');
-        };
+
+          allApiBooks = Object.values(cache.byId).map(book => ({
+            id: parseInt(book.id)
+          }));
+        }
 
         try {
-          // Fetch all book IDs from Readwise API
-          let allApiBooks: any[] = [];
-          let nextUrl: string | null = 'https://readwise.io/api/v2/books/';
-          let pageCount = 0;
-
-          while (nextUrl && pageCount < 100) {
-            pageCount++;
-            const response = await fetchWithRetry(nextUrl);
-
-            const data = await response.json();
-            allApiBooks = allApiBooks.concat(data.results);
-            nextUrl = data.next;
-
-            if (pageCount % 5 === 0) {
-              console.log(`Readwise: Fetched ${allApiBooks.length} items so far...`);
-              new Notice(`Fetched ${allApiBooks.length} items... (page ${pageCount})`, 2000);
-            }
-
-            // Book LIST endpoint limited to 20 requests/minute = 3 seconds between requests
-            if (nextUrl) {
-              await new Promise(resolve => setTimeout(resolve, 3000));
-            }
-          }
-
           // Build set of tracked book IDs
           const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
 
@@ -1336,66 +1635,41 @@ export default class ReadwisePlugin extends Plugin {
           const selectedCategory = select.value;
           modal.close();
 
-          new Notice(`Fetching ${categoryMap[selectedCategory]} from Readwise...`, 10000);
+          // Check cache
+          if (!this.booksCache) {
+            this.booksCache = await this.loadBooksCache();
+          }
 
-          // Helper function to fetch with retry and rate limiting
-          // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
-          const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
-            for (let attempt = 0; attempt < maxRetries; attempt++) {
-              try {
-                const response = await fetch(url, {
-                  headers: this.getAuthHeaders()
-                });
+          let categoryBooks: any[];
 
-                if (response.status === 429) {
-                  const retryAfter = response.headers.get('Retry-After');
-                  const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
-                  console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
-                  new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
-                  await new Promise(resolve => setTimeout(resolve, waitTime));
-                  continue;
-                }
+          if (this.booksCache && this.booksCache.byCategory[selectedCategory]) {
+            // Use cached category index
+            const cacheAge = this.getCacheAgeDescription(this.booksCache);
+            new Notice(`Using cached ${categoryMap[selectedCategory]} (${cacheAge})`, 5000);
 
-                if (!response.ok) {
-                  throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-                }
+            const bookIds = this.booksCache.byCategory[selectedCategory];
+            categoryBooks = bookIds.map(id => ({
+              id: parseInt(id)
+            }));
 
-                return response;
-              } catch (e) {
-                if (attempt === maxRetries - 1) throw e;
-                const waitTime = Math.pow(2, attempt) * 1000;
-                console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
-                await new Promise(resolve => setTimeout(resolve, waitTime));
-              }
+            console.log(`Readwise: Found ${categoryBooks.length} ${selectedCategory} in cache`);
+          } else {
+            // No cache - build it or fall back to API
+            new Notice(`No cache. Building from API...`, 10000);
+            const cache = await this.buildBooksCache(true);
+
+            if (!cache || !cache.byCategory[selectedCategory]) {
+              new Notice('Failed to build cache', 10000);
+              return;
             }
-            throw new Error('Max retries exceeded');
-          };
+
+            const bookIds = cache.byCategory[selectedCategory];
+            categoryBooks = bookIds.map(id => ({
+              id: parseInt(id)
+            }));
+          }
 
           try {
-            // Fetch all books of this category
-            let categoryBooks: any[] = [];
-            let nextUrl: string | null = `https://readwise.io/api/v2/books/?category=${selectedCategory}`;
-            let pageCount = 0;
-
-            while (nextUrl) {
-              pageCount++;
-              const response = await fetchWithRetry(nextUrl);
-
-              const data = await response.json();
-              categoryBooks = categoryBooks.concat(data.results);
-              nextUrl = data.next;
-
-              if (pageCount % 3 === 0) {
-                console.log(`Readwise: Fetched ${categoryBooks.length} ${selectedCategory}... (page ${pageCount})`);
-                new Notice(`Fetched ${categoryBooks.length} ${selectedCategory}... (page ${pageCount})`, 2000);
-              }
-
-              // Book LIST endpoint limited to 20 requests/minute = 3 seconds between requests
-              if (nextUrl) {
-                await new Promise(resolve => setTimeout(resolve, 3000));
-              }
-            }
-
             // Find missing ones
             const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
             const missingBookIds = categoryBooks
@@ -1423,6 +1697,65 @@ export default class ReadwisePlugin extends Plugin {
         };
 
         modal.open();
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-rebuild-cache',
+      name: 'Rebuild book cache',
+      callback: async () => {
+        const cache = await this.buildBooksCache(true);
+        if (cache) {
+          new Notice(`Cache rebuilt: ${cache.totalBooks} books`, 5000);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-clear-cache',
+      name: 'Clear book cache',
+      callback: async () => {
+        await this.clearBooksCache();
+        new Notice('Book cache cleared', 5000);
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-cache-stats',
+      name: 'View cache statistics',
+      callback: async () => {
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
+
+        if (!this.booksCache) {
+          new Notice('No cache available. Run "Rebuild book cache" first.', 5000);
+          return;
+        }
+
+        const cache = this.booksCache;
+        const cacheAge = this.getCacheAgeDescription(cache);
+        const isStale = this.isCacheStale(cache);
+
+        let stats = '# Book Cache Statistics\n\n';
+        stats += `**Last updated:** ${cache.lastUpdated} (${cacheAge})\n`;
+        stats += `**Status:** ${isStale ? '⚠️ Stale (>7 days)' : '✓ Fresh'}\n`;
+        stats += `**Total books:** ${cache.totalBooks}\n\n`;
+        stats += '## By Category\n';
+        stats += `- Articles: ${cache.byCategory.articles?.length || 0}\n`;
+        stats += `- Books: ${cache.byCategory.books?.length || 0}\n`;
+        stats += `- Tweets: ${cache.byCategory.tweets?.length || 0}\n`;
+        stats += `- Podcasts: ${cache.byCategory.podcasts?.length || 0}\n\n`;
+        stats += '## Actions\n';
+        stats += '- Run "Rebuild book cache" to refresh data from API\n';
+        stats += '- Run "Clear book cache" to delete cache file\n';
+
+        const reportFile = `${this.settings.readwiseDir}/Cache-Stats-${Date.now()}.md`;
+        await this.app.vault.create(reportFile, stats);
+        const file = this.app.vault.getAbstractFileByPath(reportFile);
+        if (file) {
+          // @ts-ignore
+          await this.app.workspace.getLeaf().openFile(file);
+        }
+
+        new Notice('Cache statistics generated', 5000);
       }
     });
     this.registerMarkdownPostProcessor((el, ctx) => {
