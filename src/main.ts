@@ -13,6 +13,7 @@ import {
 import * as zip from "@zip.js/zip.js";
 import { Md5 } from "ts-md5";
 import { StatusBar } from "./status";
+import { Logger, LogLevel } from './logger';
 
 // keep pluginVersion in sync with manifest.json
 const pluginVersion = "3.0.1";
@@ -94,6 +95,9 @@ interface ReadwisePluginSettings {
 
   /** User choice for confirming delete and reimport */
   reimportShowConfirmation: boolean;
+
+  /** Log level for console output */
+  logLevel: LogLevel;
 }
 
 // define our initial settings
@@ -111,7 +115,8 @@ const DEFAULT_SETTINGS: ReadwisePluginSettings = {
   "booksToRefresh": [],
   "failedBooks": [],
   "booksIDsMap": {},
-  "reimportShowConfirmation": true
+  "reimportShowConfirmation": true,
+  "logLevel": LogLevel.WARN
 };
 
 /** The name of the Readwise Sync history file, without the extension.
@@ -126,6 +131,7 @@ export default class ReadwisePlugin extends Plugin {
   scheduleInterval: null | number = null;
   statusBar: StatusBar;
   booksCache: ReadwiseBooksCache | null = null;
+  logger: Logger;
 
   getErrorMessageFromResponse(response: Response) {
     if (response && response.status === 409) {
@@ -176,14 +182,14 @@ export default class ReadwisePlugin extends Plugin {
     const hasItemsToRefresh = this.settings.booksToRefresh.length > 0 || this.settings.failedBooks.length > 0;
 
     if (statusID <= this.settings.lastSavedStatusID && !hasItemsToRefresh) {
-      console.log(`[Readwise-Phillip] Already saved data from export ${statusID}`);
+      this.logger.info(`Already saved data from export ${statusID}`);
       await this.handleSyncSuccess(buttonContext);
       this.notice("Readwise data is already up to date", false, 4);
       return;
     }
 
     if (statusID <= this.settings.lastSavedStatusID && hasItemsToRefresh) {
-      console.log(`[Readwise-Phillip] Export ${statusID} already saved, but forcing download for ${this.settings.booksToRefresh.length} queued items`);
+      this.logger.info(`Export ${statusID} already saved, but forcing download for ${this.settings.booksToRefresh.length} queued items`);
     }
     const processedArtifactIds = _processedArtifactIds ?? new Set();
     const unknownStatusCount = _unknownStatusCount ?? 0;
@@ -207,7 +213,7 @@ export default class ReadwisePlugin extends Plugin {
 
       if (response && response.ok) {
         const data: ExportStatusResponse = await response.json();
-        console.log(`[Readwise-Phillip] getExportStatus: status=${data.taskStatus}, booksExported=${data.booksExported}/${data.totalBooks}, artifactIds=${data.artifactIds?.length || 0}`);
+        this.logger.debug(`getExportStatus: status=${data.taskStatus}, booksExported=${data.booksExported}/${data.totalBooks}, artifactIds=${data.artifactIds?.length || 0}`);
 
         const WAITING_STATUSES = ['PENDING', 'RECEIVED', 'STARTED', 'RETRY'];
         const SUCCESS_STATUSES = ['SUCCESS'];
@@ -219,27 +225,27 @@ export default class ReadwisePlugin extends Plugin {
 
         // If UNKNOWN and no progress for 30 seconds, or UNKNOWN persists for 60 seconds total
         if (data.taskStatus === 'UNKNOWN' && (unknownStatusCount >= 60 || (isStuck && unknownStatusCount >= 30))) {
-          console.log(`[Readwise-Phillip] UNKNOWN status persisted for ${unknownStatusCount} attempts`);
-          console.log("[Readwise-Phillip] data at timeout:", data);
+          this.logger.warn(`UNKNOWN status persisted for ${unknownStatusCount} attempts`);
+          this.logger.debug("data at timeout:", data);
 
           // Check if export is actually complete
           const isComplete = data.isFinished || (data.booksExported && data.totalBooks && data.booksExported >= data.totalBooks);
 
           if (isComplete) {
-            console.log("[Readwise-Phillip] Export appears complete despite UNKNOWN status");
+            this.logger.info("Export appears complete despite UNKNOWN status");
             // Treat as success
             await downloadUnprocessedArtifacts(data.artifactIds);
             await this.acknowledgeSyncCompleted(buttonContext);
             await this.handleSyncSuccess(buttonContext, "Synced!", statusID);
             this.notice("Readwise sync completed", true, 1, true);
-            console.log("[Readwise-Phillip] completed sync");
+            this.logger.info("completed sync");
             // @ts-ignore
             if (this.app.isMobile) {
               this.notice("If you don't see all of your Readwise files, please reload the Obsidian app", true,);
             }
             return;
           } else {
-            console.log("[Readwise-Phillip] Export appears incomplete, treating as error");
+            this.logger.error("Export appears incomplete, treating as error");
             await this.handleSyncError(buttonContext, "Sync timed out with UNKNOWN status");
             return;
           }
@@ -248,7 +254,7 @@ export default class ReadwisePlugin extends Plugin {
         if (WAITING_STATUSES.includes(data.taskStatus) || data.taskStatus === 'UNKNOWN') {
           if (data.taskStatus === 'UNKNOWN') {
             const progressInfo = isStuck ? ` - STUCK at ${currentBooksExported}/${data.totalBooks}` : ` - progressing (${currentBooksExported}/${data.totalBooks})`;
-            console.log(`[Readwise-Phillip] UNKNOWN status encountered (attempt ${newUnknownCount}/60)${progressInfo}`);
+            this.logger.warn(`UNKNOWN status encountered (attempt ${newUnknownCount}/60)${progressInfo}`);
           }
           if (data.booksExported) {
             const progressMsg = `Exporting Readwise data (${data.booksExported} / ${data.totalBooks}) ...`;
@@ -272,7 +278,7 @@ export default class ReadwisePlugin extends Plugin {
             pollInterval = 2000; // 2 seconds - more responsive near end
           }
 
-          console.log(`[Readwise-Phillip] Waiting ${pollInterval/1000}s before next poll...`);
+          this.logger.debug(`Waiting ${pollInterval/1000}s before next poll...`);
           await new Promise(resolve => setTimeout(resolve, pollInterval));
           // then keep polling
           await this.getExportStatus(statusID, buttonContext, processedArtifactIds, newUnknownCount, currentBooksExported);
@@ -283,23 +289,23 @@ export default class ReadwisePlugin extends Plugin {
           await this.acknowledgeSyncCompleted(buttonContext);
           await this.handleSyncSuccess(buttonContext, "Synced!", statusID);
           this.notice("Readwise sync completed", true, 1, true);
-          console.log("[Readwise-Phillip] completed sync");
+          this.logger.info("completed sync");
           // @ts-ignore
           if (this.app.isMobile) {
             this.notice("If you don't see all of your Readwise files, please reload the Obsidian app", true,);
 
           }
         } else {
-          console.log("[Readwise-Phillip] unexpected status in getExportStatus: ", data);
+          this.logger.error("unexpected status in getExportStatus: ", data);
           await this.handleSyncError(buttonContext, "Sync failed - unexpected status: " + data.taskStatus);
           return;
         }
       } else {
-        console.log("[Readwise-Phillip] bad response in getExportStatus: ", response);
+        this.logger.error("bad response in getExportStatus: ", response);
         await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       }
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed in getExportStatus: ", e);
+      this.logger.error("fetch failed in getExportStatus: ", e);
       await this.handleSyncError(buttonContext, "Sync failed");
     }
   }
@@ -311,7 +317,7 @@ export default class ReadwisePlugin extends Plugin {
       return;
     }
 
-    console.log('[Readwise-Phillip] queueExport, requesting archive...');
+    this.logger.info('queueExport, requesting archive...');
     this.settings.isSyncing = true;
     await this.saveSettings();
 
@@ -325,7 +331,7 @@ export default class ReadwisePlugin extends Plugin {
     if (auto) {
       url += `&auto=${auto}`;
     }
-    console.log("[Readwise-Phillip] endpoint: ", url);
+    this.logger.debug("endpoint: ", url);
     let response, data: ExportRequestResponse;
     try {
       response = await fetch(
@@ -335,7 +341,7 @@ export default class ReadwisePlugin extends Plugin {
         }
       );
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed in queueExport: ", e);
+      this.logger.error("fetch failed in queueExport: ", e);
     }
 
     if (response && response.ok) {
@@ -344,41 +350,41 @@ export default class ReadwisePlugin extends Plugin {
       if (data.latest_id <= this.settings.lastSavedStatusID) {
         await this.handleSyncSuccess(buttonContext);
         this.notice("Readwise data is already up to date", false, 4, true);
-        console.log("[Readwise-Phillip] Readwise data is already up to date");
+        this.logger.info("Readwise data is already up to date");
         //return;
       }
 
       // save the sync status ID so it can be polled until the archive is ready
       this.settings.currentSyncStatusID = data.latest_id;
       await this.saveSettings();
-      console.log("[Readwise-Phillip] saved currentSyncStatusID", this.settings.currentSyncStatusID);
+      this.logger.debug("saved currentSyncStatusID", this.settings.currentSyncStatusID);
 
       if (response.status === 201) {
         this.notice("Syncing Readwise data");
         await this.getExportStatus(this.settings.currentSyncStatusID, buttonContext);
-        console.log('[Readwise-Phillip] queueExport done');
+        this.logger.info('queueExport done');
       } else {
         // Status 200 - export already exists
         // But if we have items queued for refresh, we should still download to get them
         const hasItemsToRefresh = this.settings.booksToRefresh.length > 0 || this.settings.failedBooks.length > 0;
 
         if (hasItemsToRefresh) {
-          console.log(`[Readwise-Phillip] Export exists but we have ${this.settings.booksToRefresh.length} books to refresh and ${this.settings.failedBooks.length} failed books - forcing download`);
+          this.logger.info(`Export exists but we have ${this.settings.booksToRefresh.length} books to refresh and ${this.settings.failedBooks.length} failed books - forcing download`);
           this.notice("Downloading refreshed items...");
           await this.getExportStatus(this.settings.currentSyncStatusID, buttonContext);
-          console.log('[Readwise-Phillip] queueExport done');
+          this.logger.info('queueExport done');
         } else {
           await this.handleSyncSuccess(buttonContext, "Synced", data.latest_id);
           this.notice("Latest Readwise sync already happened on your other device. Data should be up to date", false, 4, true);
         }
       }
     } else {
-      console.log("[Readwise-Phillip] bad response in queueExport: ", response);
+      this.logger.error("bad response in queueExport: ", response);
       await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       return;
     }
 
-    console.log("[Readwise-Phillip] queueExport end");
+    this.logger.debug("queueExport end");
   }
 
   notice(msg: string, show = false, timeout = 0, forcing: boolean = false) {
@@ -422,9 +428,9 @@ export default class ReadwisePlugin extends Plugin {
 
     if (existingBookID && existingBookID !== bookID) {
       // Collision detected - filename exists and tracks a different book
-      console.log(`[Readwise-Phillip] COLLISION DETECTED: ${baseFilename}`);
-      console.log(`[Readwise-Phillip]   Existing book ID: ${existingBookID}`);
-      console.log(`[Readwise-Phillip]   New book ID: ${bookID}`);
+      this.logger.warn(`COLLISION DETECTED: ${baseFilename}`);
+      this.logger.warn(`  Existing book ID: ${existingBookID}`);
+      this.logger.warn(`  New book ID: ${bookID}`);
 
       // Append book ID to make it unique: "Title.md" -> "Title (ID-12345).md"
       const lastDotIndex = baseFilename.lastIndexOf('.');
@@ -432,7 +438,7 @@ export default class ReadwisePlugin extends Plugin {
       const ext = baseFilename.substring(lastDotIndex);
       const uniqueFilename = `${nameWithoutExt} (ID-${bookID})${ext}`;
 
-      console.log(`[Readwise-Phillip]   Resolved to: ${uniqueFilename}`);
+      this.logger.debug(`  Resolved to: ${uniqueFilename}`);
       return uniqueFilename;
     }
 
@@ -440,15 +446,15 @@ export default class ReadwisePlugin extends Plugin {
   }
 
   async downloadArtifact(artifactId: number, buttonContext: ButtonComponent): Promise<void> {
-    console.log(`[Readwise-Phillip] downloadArtifact: Starting download of artifact ${artifactId}`);
+    this.logger.info(`downloadArtifact: Starting download of artifact ${artifactId}`);
 
     // Check if we're doing a targeted refresh
     const hasTargetedRefresh = this.settings.booksToRefresh.length > 0 || this.settings.failedBooks.length > 0;
     const targetBookIds = new Set([...this.settings.booksToRefresh, ...this.settings.failedBooks]);
 
     if (hasTargetedRefresh) {
-      console.log(`[Readwise-Phillip] downloadArtifact: Targeted refresh for ${targetBookIds.size} specific items`);
-      console.log(`[Readwise-Phillip] downloadArtifact: Target IDs:`, Array.from(targetBookIds));
+      this.logger.debug(`downloadArtifact: Targeted refresh for ${targetBookIds.size} specific items`);
+      this.logger.debug(`downloadArtifact: Target IDs:`, Array.from(targetBookIds));
     }
 
     // download archive from this endpoint
@@ -460,12 +466,12 @@ export default class ReadwisePlugin extends Plugin {
         artifactURL, { headers: this.getAuthHeaders() }
       );
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed in downloadExport: ", e);
+      this.logger.error("fetch failed in downloadExport: ", e);
     }
     if (response && response.ok) {
       blob = await response.blob();
     } else {
-      console.log("[Readwise-Phillip] bad response in downloadExport: ", response);
+      this.logger.error("bad response in downloadExport: ", response);
       await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       throw new Error(`Readwise: error while fetching artifact ${artifactId}`);
     }
@@ -475,7 +481,7 @@ export default class ReadwisePlugin extends Plugin {
     const blobReader = new zip.BlobReader(blob);
     const zipReader = new zip.ZipReader(blobReader);
     const entries = await zipReader.getEntries();
-    console.log(`[Readwise-Phillip] downloadArtifact: Artifact ${artifactId} contains ${entries.length} entries`);
+    this.logger.debug(`downloadArtifact: Artifact ${artifactId} contains ${entries.length} entries`);
 
     const foundTargetIds = new Set<string>();
     const allBookIdsInArtifact: string[] = [];
@@ -523,12 +529,12 @@ export default class ReadwisePlugin extends Plugin {
           // Track if this is one of our target items
           if (hasTargetedRefresh && bookID && targetBookIds.has(bookID)) {
             foundTargetIds.add(bookID);
-            console.log(`[Readwise-Phillip] downloadArtifact: ✓ FOUND TARGET ITEM - bookID: ${bookID} from entry ${entry.filename}`);
+            this.logger.debug(`downloadArtifact: ✓ FOUND TARGET ITEM - bookID: ${bookID} from entry ${entry.filename}`);
           }
 
           const undefinedBook = !bookID || !processedFileName;
           if (undefinedBook && !isReadwiseSyncFile) {
-            console.error(`Error while processing entry: ${entry.filename}`);
+            this.logger.error(`Error while processing entry: ${entry.filename}`);
           }
 
           // Check for filename collision and resolve before processing
@@ -544,7 +550,7 @@ export default class ReadwisePlugin extends Plugin {
             let processedFullDocumentTextFileName = data.full_document_text_path.replace(/^Readwise/, this.settings.readwiseDir);
             // Check for collision and resolve
             processedFullDocumentTextFileName = this.resolveFilenameCollision(processedFullDocumentTextFileName, bookID);
-            console.log(`[Readwise-Phillip] downloadArtifact: Writing full document text for bookID ${bookID}: ${processedFullDocumentTextFileName}`);
+            this.logger.debug(`downloadArtifact: Writing full document text for bookID ${bookID}: ${processedFullDocumentTextFileName}`);
             // track the book
             this.settings.booksIDsMap[processedFullDocumentTextFileName] = bookID;
             // ensure the directory exists
@@ -565,7 +571,7 @@ export default class ReadwisePlugin extends Plugin {
           // write the actual files
           let contentToSave = data.full_content ?? data.append_only_content;
           if (contentToSave) {
-            console.log(`[Readwise-Phillip] downloadArtifact: Writing highlights file for bookID ${bookID}: ${finalProcessedFileName}`);
+            this.logger.debug(`downloadArtifact: Writing highlights file for bookID ${bookID}: ${finalProcessedFileName}`);
             // track the book
             this.settings.booksIDsMap[finalProcessedFileName] = bookID;
             // ensure the directory exists
@@ -576,18 +582,18 @@ export default class ReadwisePlugin extends Plugin {
               const existingContentHash = Md5.hashStr(existingContent).toString();
               if (existingContentHash !== data.last_content_hash) {
                 // content has been modified (it differs from the previously exported full document)
-                console.log(`[Readwise-Phillip] downloadArtifact: File exists and was modified locally, appending new content`);
+                this.logger.debug(`downloadArtifact: File exists and was modified locally, appending new content`);
                 contentToSave = existingContent.trimEnd() + "\n" + data.append_only_content;
               } else {
-                console.log(`[Readwise-Phillip] downloadArtifact: File exists and unchanged, overwriting with full content`);
+                this.logger.debug(`downloadArtifact: File exists and unchanged, overwriting with full content`);
               }
             } else {
-              console.log(`[Readwise-Phillip] downloadArtifact: Creating new file`);
+              this.logger.debug(`downloadArtifact: Creating new file`);
             }
             await this.fs.write(finalProcessedFileName, contentToSave);
-            console.log(`[Readwise-Phillip] downloadArtifact: Successfully wrote file for bookID ${bookID}`);
+            this.logger.debug(`downloadArtifact: Successfully wrote file for bookID ${bookID}`);
           } else {
-            console.log(`[Readwise-Phillip] downloadArtifact: No content to save for bookID ${bookID} (entry: ${entry.filename})`);
+            this.logger.debug(`downloadArtifact: No content to save for bookID ${bookID} (entry: ${entry.filename})`);
           }
 
           // save the entry in settings to ensure that it can be
@@ -595,7 +601,7 @@ export default class ReadwisePlugin extends Plugin {
           // the user has `settings.refreshBooks` enabled
           if (bookID) await this.saveSettings();
         } catch (e) {
-          console.log(`[Readwise-Phillip] error writing ${finalProcessedFileName}:`, e);
+          this.logger.error(`error writing ${finalProcessedFileName}:`, e);
           this.notice(`Readwise: error while writing ${finalProcessedFileName}: ${e}`, true, 4, true);
           if (bookID) {
             // handles case where user doesn't have `settings.refreshBooks` enabled
@@ -616,21 +622,21 @@ export default class ReadwisePlugin extends Plugin {
 
     // Summary logging for targeted refresh
     if (hasTargetedRefresh) {
-      console.log(`[Readwise-Phillip] downloadArtifact SUMMARY for artifact ${artifactId}:`);
-      console.log(`[Readwise-Phillip]   Total entries in artifact: ${entries.length}`);
-      console.log(`[Readwise-Phillip]   Processed (target items): ${processedCount}`);
-      console.log(`[Readwise-Phillip]   Skipped (not in target list): ${skippedCount}`);
-      console.log(`[Readwise-Phillip]   Target items found: ${foundTargetIds.size} of ${targetBookIds.size}`);
+      this.logger.debug(`downloadArtifact SUMMARY for artifact ${artifactId}:`);
+      this.logger.debug(`  Total entries in artifact: ${entries.length}`);
+      this.logger.debug(`  Processed (target items): ${processedCount}`);
+      this.logger.debug(`  Skipped (not in target list): ${skippedCount}`);
+      this.logger.debug(`  Target items found: ${foundTargetIds.size} of ${targetBookIds.size}`);
 
       if (foundTargetIds.size > 0) {
-        console.log(`[Readwise-Phillip]   Found IDs:`, Array.from(foundTargetIds));
+        this.logger.debug(`  Found IDs:`, Array.from(foundTargetIds));
       }
 
       const missingTargetIds = Array.from(targetBookIds).filter(id => !foundTargetIds.has(id));
       if (missingTargetIds.length > 0) {
-        console.log(`[Readwise-Phillip]   ⚠️ NOT FOUND in this artifact:`, missingTargetIds);
-        console.log(`[Readwise-Phillip]   Sample of what IS in artifact (first 10):`, allBookIdsInArtifact.slice(0, 10));
-        console.log(`[Readwise-Phillip]   Sample of what IS in artifact (last 10):`, allBookIdsInArtifact.slice(-10));
+        this.logger.debug(`  ⚠️ NOT FOUND in this artifact:`, missingTargetIds);
+        this.logger.debug(`  Sample of what IS in artifact (first 10):`, allBookIdsInArtifact.slice(0, 10));
+        this.logger.debug(`  Sample of what IS in artifact (last 10):`, allBookIdsInArtifact.slice(-10));
       }
     }
 
@@ -640,17 +646,17 @@ export default class ReadwisePlugin extends Plugin {
     // wait for the metadata cache to process created/updated documents
     await new Promise<void>((resolve) => {
       const timeoutSeconds = 15;
-      console.log(`[Readwise-Phillip] waiting for metadata cache processing for up to ${timeoutSeconds}s...`)
+      this.logger.debug(`waiting for metadata cache processing for up to ${timeoutSeconds}s...`)
       const timeout = setTimeout(() => {
         this.app.metadataCache.offref(eventRef);
-        console.log("[Readwise-Phillip] metadata cache processing timeout reached.");
+        this.logger.warn("metadata cache processing timeout reached.");
         resolve();
       }, timeoutSeconds * 1000);
 
       const eventRef = this.app.metadataCache.on("resolved", () => {
         this.app.metadataCache.offref(eventRef);
         clearTimeout(timeout);
-        console.log("[Readwise-Phillip] metadata cache processing has finished.");
+        this.logger.debug("metadata cache processing has finished.");
         resolve();
       });
     });
@@ -666,12 +672,12 @@ export default class ReadwisePlugin extends Plugin {
           method: "POST",
         });
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed to acknowledged sync: ", e);
+      this.logger.error("fetch failed to acknowledged sync: ", e);
     }
     if (response && response.ok) {
       return;
     } else {
-      console.log("[Readwise-Phillip] bad response in acknowledge sync: ", response);
+      this.logger.error("bad response in acknowledge sync: ", response);
       await this.handleSyncError(buttonContext, this.getErrorMessageFromResponse(response));
       return;
     }
@@ -695,14 +701,14 @@ export default class ReadwisePlugin extends Plugin {
 
       // Validate cache version
       if (cache.version !== 1) {
-        console.log('Readwise: Cache version mismatch, ignoring cache');
+        this.logger.warn('Cache version mismatch, ignoring cache');
         return null;
       }
 
-      console.log(`Readwise: Loaded cache with ${cache.totalBooks} books from ${cache.lastUpdated}`);
+      this.logger.info(`Loaded cache with ${cache.totalBooks} books from ${cache.lastUpdated}`);
       return cache;
     } catch (e) {
-      console.error('Readwise: Error loading cache:', e);
+      this.logger.error('Error loading cache:', e);
       return null;
     }
   }
@@ -712,9 +718,9 @@ export default class ReadwisePlugin extends Plugin {
       const cachePath = this.getCachePath();
       const cacheData = JSON.stringify(cache, null, 2);
       await this.app.vault.adapter.write(cachePath, cacheData);
-      console.log(`Readwise: Saved cache with ${cache.totalBooks} books to ${cachePath}`);
+      this.logger.info(`Saved cache with ${cache.totalBooks} books to ${cachePath}`);
     } catch (e) {
-      console.error('Readwise: Error saving cache:', e);
+      this.logger.error('Error saving cache:', e);
     }
   }
 
@@ -725,10 +731,10 @@ export default class ReadwisePlugin extends Plugin {
       if (cacheExists) {
         await this.app.vault.adapter.remove(cachePath);
         this.booksCache = null;
-        console.log('Readwise: Cache cleared');
+        this.logger.info('Cache cleared');
       }
     } catch (e) {
-      console.error('Readwise: Error clearing cache:', e);
+      this.logger.error('Error clearing cache:', e);
     }
   }
 
@@ -768,7 +774,7 @@ export default class ReadwisePlugin extends Plugin {
           if (response.status === 429) {
             const retryAfter = response.headers.get('Retry-After');
             const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
-            console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+            this.logger.warn(`Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
             if (showNotices) {
               new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
             }
@@ -784,7 +790,7 @@ export default class ReadwisePlugin extends Plugin {
         } catch (e) {
           if (attempt === maxRetries - 1) throw e;
           const waitTime = Math.pow(2, attempt) * 1000;
-          console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+          this.logger.debug(`Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
           await new Promise(resolve => setTimeout(resolve, waitTime));
         }
       }
@@ -804,7 +810,7 @@ export default class ReadwisePlugin extends Plugin {
         nextUrl = data.next;
 
         if (pageCount % 5 === 0 && showNotices) {
-          console.log(`Readwise: Cached ${allApiBooks.length} books... (page ${pageCount})`);
+          this.logger.debug(`Cached ${allApiBooks.length} books... (page ${pageCount})`);
           new Notice(`Caching books: ${allApiBooks.length} so far...`, 2000);
         }
 
@@ -861,7 +867,7 @@ export default class ReadwisePlugin extends Plugin {
 
       return cache;
     } catch (e) {
-      console.error('Readwise: Error building cache:', e);
+      this.logger.error('Error building cache:', e);
       if (showNotices) {
         new Notice(`Error building cache: ${e.message}`, 10000);
       }
@@ -872,13 +878,13 @@ export default class ReadwisePlugin extends Plugin {
   /** Fetch and save highlights for specific book IDs directly via API.
    * Bypasses export system for faster targeted refresh. */
   async syncSpecificBooksDirect(bookIds: string[]): Promise<{ success: number, failed: string[] }> {
-    console.log(`[Readwise-Phillip] syncSpecificBooksDirect: Syncing ${bookIds.length} books via direct API`);
+    this.logger.info(`syncSpecificBooksDirect: Syncing ${bookIds.length} books via direct API`);
 
     const results = { success: 0, failed: [] as string[] };
 
     for (const bookId of bookIds) {
       try {
-        console.log(`[Readwise-Phillip] syncSpecificBooksDirect: Fetching book ${bookId}`);
+        this.logger.debug(`syncSpecificBooksDirect: Fetching book ${bookId}`);
 
         // Fetch book metadata
         const bookResponse = await fetch(`${baseURL}/api/v2/books/${bookId}/`, {
@@ -886,17 +892,17 @@ export default class ReadwisePlugin extends Plugin {
         });
 
         if (!bookResponse.ok) {
-          console.error(`[Readwise-Phillip] Failed to fetch book ${bookId}: ${bookResponse.status}`);
+          this.logger.error(`Failed to fetch book ${bookId}: ${bookResponse.status}`);
           results.failed.push(bookId);
           continue;
         }
 
         const book = await bookResponse.json();
-        console.log(`[Readwise-Phillip] Book ${bookId}: "${book.title}" (${book.category}), ${book.num_highlights} highlights`);
+        this.logger.debug(`Book ${bookId}: "${book.title}" (${book.category}), ${book.num_highlights} highlights`);
 
         // Skip if no highlights
         if (book.num_highlights === 0) {
-          console.log(`[Readwise-Phillip] Skipping book ${bookId} - no highlights`);
+          this.logger.debug(`Skipping book ${bookId} - no highlights`);
           results.failed.push(bookId);
           continue;
         }
@@ -916,7 +922,7 @@ export default class ReadwisePlugin extends Plugin {
         content += `\n---\n\n`;
 
         if (!highlightsResponse.ok) {
-          console.error(`[Readwise-Phillip] Failed to fetch highlights for book ${bookId}: ${highlightsResponse.status}`);
+          this.logger.error(`Failed to fetch highlights for book ${bookId}: ${highlightsResponse.status}`);
 
           // Create stub file documenting the failure
           content += `## ⚠️ Sync Error\n\n`;
@@ -935,12 +941,12 @@ export default class ReadwisePlugin extends Plugin {
           content += `4. This file was created as a placeholder to prevent continuous "missing item" errors\n\n`;
           content += `**Sync Attempted:** ${new Date().toISOString()}\n`;
 
-          console.log(`[Readwise-Phillip] Creating stub file for inaccessible book ${bookId}`);
+          this.logger.info(`Creating stub file for inaccessible book ${bookId}`);
         } else {
           const highlightsData = await highlightsResponse.json();
           const highlights = highlightsData.results;
 
-          console.log(`[Readwise-Phillip] Fetched ${highlights.length} highlights for book ${bookId}`);
+          this.logger.debug(`Fetched ${highlights.length} highlights for book ${bookId}`);
 
           // Add highlights
           highlights.forEach((highlight: any) => {
@@ -965,11 +971,11 @@ export default class ReadwisePlugin extends Plugin {
         // Track in booksIDsMap
         this.settings.booksIDsMap[finalFileName] = bookId;
 
-        console.log(`[Readwise-Phillip] ✓ Saved book ${bookId} to ${finalFileName}`);
+        this.logger.info(`✓ Saved book ${bookId} to ${finalFileName}`);
         results.success++;
 
       } catch (e) {
-        console.error(`[Readwise-Phillip] Error syncing book ${bookId}:`, e);
+        this.logger.error(`Error syncing book ${bookId}:`, e);
         results.failed.push(bookId);
       }
 
@@ -984,7 +990,7 @@ export default class ReadwisePlugin extends Plugin {
   async configureSchedule() {
     const minutes = parseInt(this.settings.frequency);
     let milliseconds = minutes * 60 * 1000; // minutes * seconds * milliseconds
-    console.log('[Readwise-Phillip] setting interval to ', milliseconds, 'milliseconds');
+    this.logger.debug('setting interval to ', milliseconds, 'milliseconds');
     window.clearInterval(this.scheduleInterval);
     this.scheduleInterval = null;
     if (!milliseconds) {
@@ -1023,14 +1029,14 @@ export default class ReadwisePlugin extends Plugin {
     }
 
     if (!targetBookIds.length) {
-      console.log('[Readwise-Phillip] no targetBookIds, checking for new highlights');
+      this.logger.info('no targetBookIds, checking for new highlights');
       // no need to hit refresh_book_export;
       // just check if there's new highlights from the server
       await this.queueExport();
       return;
     }
 
-    console.log('[Readwise-Phillip] refreshing books', { targetBookIds });
+    this.logger.debug('refreshing books', { targetBookIds });
 
     let requestBookIds: string[] = [];
     let requestReaderDocumentIds: string[] = [];
@@ -1047,9 +1053,9 @@ export default class ReadwisePlugin extends Plugin {
       }
     });
 
-    console.log(`[Readwise-Phillip] Requesting refresh for ${requestBookIds.length} book IDs and ${requestReaderDocumentIds.length} reader document IDs`);
-    console.log(`[Readwise-Phillip] Book IDs:`, requestBookIds);
-    console.log(`[Readwise-Phillip] Reader Document IDs:`, requestReaderDocumentIds);
+    this.logger.info(`Requesting refresh for ${requestBookIds.length} book IDs and ${requestReaderDocumentIds.length} reader document IDs`);
+    this.logger.debug(`Book IDs:`, requestBookIds);
+    this.logger.debug(`Reader Document IDs:`, requestReaderDocumentIds);
 
     try {
       const response = await fetch(
@@ -1071,19 +1077,19 @@ export default class ReadwisePlugin extends Plugin {
 
       if (response && response.ok) {
         const responseData = await response.json();
-        console.log("[Readwise-Phillip] Response OK from refresh_book_export:", responseData);
-        console.log("[Readwise-Phillip] Proceeding to queueExport()");
+        this.logger.debug("Response OK from refresh_book_export:", responseData);
+        this.logger.debug("Proceeding to queueExport()");
         await this.queueExport();
         return;
       } else {
-        console.log(`[Readwise-Phillip] saving book id ${bookIds} to refresh later`);
+        this.logger.info(`saving book id ${bookIds} to refresh later`);
         const deduplicatedBookIds = new Set([...this.settings.booksToRefresh, ...bookIds]);
         this.settings.booksToRefresh = Array.from(deduplicatedBookIds);
         await this.saveSettings();
         return;
       }
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed in syncBookHighlights: ", e);
+      this.logger.error("fetch failed in syncBookHighlights: ", e);
     }
   }
 
@@ -1110,7 +1116,7 @@ export default class ReadwisePlugin extends Plugin {
   async removeBooksFromRefresh(bookIds: Array<string> = []) {
     if (!bookIds.length) return;
 
-    console.log(`[Readwise-Phillip] removing book ids ${bookIds.join(', ')} from refresh list`);
+    this.logger.debug(`removing book ids ${bookIds.join(', ')} from refresh list`);
     this.settings.booksToRefresh = this.settings.booksToRefresh.filter(n => !bookIds.includes(n));
 
     // don't forget to save after!
@@ -1120,7 +1126,7 @@ export default class ReadwisePlugin extends Plugin {
   async removeBookFromFailedBooks(bookIds: Array<string> = []) {
     if (!bookIds.length) return;
 
-    console.log(`[Readwise-Phillip] removing book ids ${bookIds.join(', ')} from failed list`);
+    this.logger.debug(`removing book ids ${bookIds.join(', ')} from failed list`);
     this.settings.failedBooks = this.settings.failedBooks.filter(n => !bookIds.includes(n));
 
     // don't forget to save after!
@@ -1138,7 +1144,7 @@ export default class ReadwisePlugin extends Plugin {
       // because the user may have `settings.refreshBooks` disabled
       await this.syncBookHighlights([bookId]);
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed in Reimport current file: ", e);
+      this.logger.error("fetch failed in Reimport current file: ", e);
     }
   }
 
@@ -1153,11 +1159,14 @@ export default class ReadwisePlugin extends Plugin {
   async onload() {
     await this.loadSettings();
 
+    // Initialize logger with saved log level
+    this.logger = new Logger(this.settings.logLevel);
+
     // Load cache into memory (non-blocking)
     this.loadBooksCache().then(cache => {
       if (cache) {
         this.booksCache = cache;
-        console.log(`Readwise: Loaded cache with ${cache.totalBooks} books`);
+        this.logger.info(`Loaded cache with ${cache.totalBooks} books`);
       }
     });
 
@@ -1182,7 +1191,7 @@ export default class ReadwisePlugin extends Plugin {
       id: 'readwise-official-sync',
       name: 'Sync your data now',
       callback: () => {
-        console.log(`Readwise: Sync triggered. booksToRefresh: ${this.settings.booksToRefresh.length}, failedBooks: ${this.settings.failedBooks.length}`);
+        this.logger.info(`Sync triggered. booksToRefresh: ${this.settings.booksToRefresh.length}, failedBooks: ${this.settings.failedBooks.length}`);
         this.syncBookHighlights();
       }
     });
@@ -1199,14 +1208,14 @@ export default class ReadwisePlugin extends Plugin {
 
         if (!this.settings.refreshBooks) {
           new Notice('Warning: "Resync deleted files" is disabled. Enable it in settings to sync refresh queue.', 10000);
-          console.log(`Readwise: refreshBooks setting is false. booksToRefresh will not be synced.`);
+          this.logger.debug(`refreshBooks setting is false. booksToRefresh will not be synced.`);
           return;
         }
 
-        console.log(`Readwise: Force refreshing ${totalToRefresh} books`);
-        console.log(`Readwise: booksToRefresh: ${this.settings.booksToRefresh.length}`);
-        console.log(`Readwise: failedBooks: ${this.settings.failedBooks.length}`);
-        console.log(`Readwise: refreshBooks setting: ${this.settings.refreshBooks}`);
+        this.logger.debug(`Force refreshing ${totalToRefresh} books`);
+        this.logger.debug(`booksToRefresh: ${this.settings.booksToRefresh.length}`);
+        this.logger.debug(`failedBooks: ${this.settings.failedBooks.length}`);
+        this.logger.debug(`refreshBooks setting: ${this.settings.refreshBooks}`);
 
         new Notice(`Force syncing ${totalToRefresh} books from refresh queue...`, 10000);
 
@@ -1214,9 +1223,9 @@ export default class ReadwisePlugin extends Plugin {
           // Call syncBookHighlights which should trigger refresh_book_export with forceRefresh
           await this.syncBookHighlights();
 
-          console.log('Readwise: Force refresh completed');
+          this.logger.info('Force refresh completed');
         } catch (e) {
-          console.error('Readwise: Error during force refresh:', e);
+          this.logger.error('Error during force refresh:', e);
           new Notice(`Error: ${e.message}`, 10000);
         }
       }
@@ -1245,7 +1254,7 @@ export default class ReadwisePlugin extends Plugin {
 
         cancelBtn.onclick = () => modal.close();
         confirmBtn.onclick = async () => {
-          console.log(`Readwise: Clearing ${totalItems} items from refresh queue`);
+          this.logger.info(`Clearing ${totalItems} items from refresh queue`);
           this.settings.booksToRefresh = [];
           this.settings.failedBooks = [];
           await this.saveSettings();
@@ -1355,7 +1364,7 @@ export default class ReadwisePlugin extends Plugin {
           diagnosticInfo += 'None\n';
         }
 
-        console.log(diagnosticInfo);
+        this.logger.info(diagnosticInfo);
         new Notice('Diagnostics printed to console', 5000);
 
         // Also create a temp file with diagnostics
@@ -1416,9 +1425,9 @@ export default class ReadwisePlugin extends Plugin {
             await this.saveSettings();
 
             new Notice(`Cleared ${selectedCategory}. Run sync to re-import.`, 5000);
-            console.log(`Readwise: Cleared ${mdFiles.length} files from ${selectedCategory}, marked ${bookIdsToRefresh.length} books for refresh`);
+            this.logger.info(`Cleared ${mdFiles.length} files from ${selectedCategory}, marked ${bookIdsToRefresh.length} books for refresh`);
           } catch (e) {
-            console.error('Error clearing category:', e);
+            this.logger.error('Error clearing category:', e);
             new Notice(`Error clearing ${selectedCategory}: ${e.message}`, 5000);
           }
           modal.close();
@@ -1465,7 +1474,7 @@ export default class ReadwisePlugin extends Plugin {
           duplicateReport += 'No duplicate filenames found.\n';
         }
 
-        console.log(duplicateReport);
+        this.logger.info(duplicateReport);
         new Notice('Duplicate report printed to console', 5000);
 
         const tempFile = `${this.settings.readwiseDir}/Readwise-Duplicates-${Date.now()}.md`;
@@ -1553,7 +1562,7 @@ export default class ReadwisePlugin extends Plugin {
         collisionReport += `- Total tracked books: ${Object.keys(this.settings.booksIDsMap).length}\n`;
         collisionReport += `- Total untracked files: ${untrackedCount}\n`;
 
-        console.log(collisionReport);
+        this.logger.info(collisionReport);
         new Notice('Collision report printed to console', 5000);
 
         const tempFile = `${this.settings.readwiseDir}/Readwise-Collisions-${Date.now()}.md`;
@@ -1592,7 +1601,7 @@ export default class ReadwisePlugin extends Plugin {
               num_highlights: book.num_highlights
             }));
 
-          console.log(`Readwise: Using ${allApiBooks.length} books from cache (${cacheAge}, excluded items with 0 highlights)`);
+          this.logger.debug(`Using ${allApiBooks.length} books from cache (${cacheAge}, excluded items with 0 highlights)`);
         } else {
           // No cache - offer to build it
           new Notice('No cache found. Building cache from API (this will take a few minutes)...', 10000);
@@ -1617,7 +1626,7 @@ export default class ReadwisePlugin extends Plugin {
         try {
           // Build set of tracked book IDs
           const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
-          console.log(`Readwise: Currently tracking ${trackedIds.size} items locally`);
+          this.logger.debug(`Currently tracking ${trackedIds.size} items locally`);
 
           // Find missing items
           const missingItems = allApiBooks.filter(book => {
@@ -1625,7 +1634,7 @@ export default class ReadwisePlugin extends Plugin {
             return !trackedIds.has(bookId);
           });
 
-          console.log(`Readwise: Found ${missingItems.length} missing items (items with 0 highlights excluded)`);
+          this.logger.debug(`Found ${missingItems.length} missing items (items with 0 highlights excluded)`);
 
           // Group by category
           const categoryCounts: { [cat: string]: number } = {};
@@ -1659,7 +1668,7 @@ export default class ReadwisePlugin extends Plugin {
             report += 'All items from Readwise are downloaded! ✓\n';
           }
 
-          console.log(report);
+          this.logger.info(report);
           new Notice(`Found ${missingItems.length} missing items. Report created.`, 10000);
 
           // Save report
@@ -1672,7 +1681,7 @@ export default class ReadwisePlugin extends Plugin {
           }
 
         } catch (e) {
-          console.error('Readwise: Error finding missing items:', e);
+          this.logger.error('Error finding missing items:', e);
           new Notice(`Error: ${e.message}`, 10000);
         }
       }
@@ -1682,7 +1691,7 @@ export default class ReadwisePlugin extends Plugin {
       name: 'Find and sync missing items (old/slow)',
       callback: async () => {
         new Notice('Querying Readwise API for all items...', 10000);
-        console.log('Readwise: Fetching all items from API...');
+        this.logger.debug('Fetching all items from API...');
 
         // Helper function to fetch with retry and rate limiting
         // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
@@ -1697,7 +1706,7 @@ export default class ReadwisePlugin extends Plugin {
                 // Rate limited - use Retry-After header
                 const retryAfter = response.headers.get('Retry-After');
                 const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 60s if no header
-                console.log(`Readwise: Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+                this.logger.warn(`Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
                 new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
                 await new Promise(resolve => setTimeout(resolve, waitTime));
                 continue;
@@ -1711,7 +1720,7 @@ export default class ReadwisePlugin extends Plugin {
             } catch (e) {
               if (attempt === maxRetries - 1) throw e;
               const waitTime = Math.pow(2, attempt) * 1000;
-              console.log(`Readwise: Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+              this.logger.debug(`Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
               await new Promise(resolve => setTimeout(resolve, waitTime));
             }
           }
@@ -1733,7 +1742,7 @@ export default class ReadwisePlugin extends Plugin {
             nextUrl = data.next;
 
             if (pageCount % 5 === 0) {
-              console.log(`Readwise: Fetched ${allApiBooks.length} items so far...`);
+              this.logger.debug(`Fetched ${allApiBooks.length} items so far...`);
               new Notice(`Fetched ${allApiBooks.length} items... (page ${pageCount})`, 2000);
             }
 
@@ -1743,11 +1752,11 @@ export default class ReadwisePlugin extends Plugin {
             }
           }
 
-          console.log(`Readwise: Fetched total of ${allApiBooks.length} items from API`);
+          this.logger.debug(`Fetched total of ${allApiBooks.length} items from API`);
 
           // Build set of tracked book IDs
           const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
-          console.log(`Readwise: Currently tracking ${trackedIds.size} items locally`);
+          this.logger.debug(`Currently tracking ${trackedIds.size} items locally`);
 
           // Find missing items
           const missingItems = allApiBooks.filter(book => {
@@ -1755,7 +1764,7 @@ export default class ReadwisePlugin extends Plugin {
             return !trackedIds.has(bookId);
           });
 
-          console.log(`Readwise: Found ${missingItems.length} missing items`);
+          this.logger.debug(`Found ${missingItems.length} missing items`);
 
           // Group by category
           const categoryCounts: { [cat: string]: number } = {};
@@ -1788,7 +1797,7 @@ export default class ReadwisePlugin extends Plugin {
             report += 'All items from Readwise are downloaded! ✓\n';
           }
 
-          console.log(report);
+          this.logger.info(report);
           new Notice(`Found ${missingItems.length} missing items. Report created.`, 10000);
 
           // Save report
@@ -1801,7 +1810,7 @@ export default class ReadwisePlugin extends Plugin {
           }
 
         } catch (e) {
-          console.error('Readwise: Error finding missing items:', e);
+          this.logger.error('Error finding missing items:', e);
           new Notice(`Error: ${e.message}`, 10000);
         }
       }
@@ -1856,7 +1865,7 @@ export default class ReadwisePlugin extends Plugin {
             return;
           }
 
-          console.log(`Readwise: Adding ${missingBookIds.length} missing items to refresh queue (items with 0 highlights excluded)`);
+          this.logger.info(`Adding ${missingBookIds.length} missing items to refresh queue (items with 0 highlights excluded)`);
 
           // Add to booksToRefresh
           this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...missingBookIds])];
@@ -1868,7 +1877,7 @@ export default class ReadwisePlugin extends Plugin {
           await this.syncBookHighlights();
 
         } catch (e) {
-          console.error('Readwise: Error resyncing missing items:', e);
+          this.logger.error('Error resyncing missing items:', e);
           new Notice(`Error: ${e.message}`, 10000);
         }
       }
@@ -1912,7 +1921,7 @@ export default class ReadwisePlugin extends Plugin {
             return;
           }
 
-          console.log(`[Readwise-Phillip] Direct sync for ${missingBookIds.length} missing items (items with 0 highlights excluded)`);
+          this.logger.info(`Direct sync for ${missingBookIds.length} missing items (items with 0 highlights excluded)`);
 
           new Notice(`Syncing ${missingBookIds.length} items directly via API...`, 5000);
 
@@ -1925,7 +1934,7 @@ export default class ReadwisePlugin extends Plugin {
 
           if (results.failed.length > 0) {
             new Notice(`⚠️ Failed to sync ${results.failed.length} items. Check console for details.`, 10000);
-            console.error(`[Readwise-Phillip] Failed book IDs:`, results.failed);
+            this.logger.error(`Failed book IDs:`, results.failed);
 
             // Add failed items to failedBooks queue
             this.settings.failedBooks = [...new Set([...this.settings.failedBooks, ...results.failed])];
@@ -1937,7 +1946,7 @@ export default class ReadwisePlugin extends Plugin {
           await this.saveSettings();
 
         } catch (e) {
-          console.error('Readwise: Error direct syncing:', e);
+          this.logger.error('Error direct syncing:', e);
           new Notice(`Error: ${e.message}`, 10000);
         }
       }
@@ -1994,7 +2003,7 @@ export default class ReadwisePlugin extends Plugin {
                 id: parseInt(book.id)
               }));
 
-            console.log(`Readwise: Found ${categoryBooks.length} ${selectedCategory} in cache (excluding 0 highlights)`);
+            this.logger.debug(`Found ${categoryBooks.length} ${selectedCategory} in cache (excluding 0 highlights)`);
           } else {
             // No cache - build it or fall back to API
             new Notice(`No cache. Building from API...`, 10000);
@@ -2026,7 +2035,7 @@ export default class ReadwisePlugin extends Plugin {
               return;
             }
 
-            console.log(`Readwise: Found ${missingBookIds.length} missing ${selectedCategory} (items with 0 highlights excluded)`);
+            this.logger.info(`Found ${missingBookIds.length} missing ${selectedCategory} (items with 0 highlights excluded)`);
 
             // Add to refresh queue and sync
             this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...missingBookIds])];
@@ -2036,7 +2045,7 @@ export default class ReadwisePlugin extends Plugin {
             await this.syncBookHighlights();
 
           } catch (e) {
-            console.error(`Readwise: Error syncing ${selectedCategory}:`, e);
+            this.logger.error(`Error syncing ${selectedCategory}:`, e);
             new Notice(`Error: ${e.message}`, 10000);
           }
         };
@@ -2318,13 +2327,13 @@ export default class ReadwisePlugin extends Plugin {
               if (fileExists) {
                 await this.app.vault.adapter.remove(filePath);
                 deletedCount++;
-                console.log(`[Readwise-Phillip] Deleted collision file: ${filePath}`);
+                this.logger.info(`Deleted collision file: ${filePath}`);
               }
 
               // Remove from booksIDsMap
               delete this.settings.booksIDsMap[filePath];
             } catch (e) {
-              console.error(`[Readwise-Phillip] Error deleting ${filePath}:`, e);
+              this.logger.error(`Error deleting ${filePath}:`, e);
               errorCount++;
             }
           }
@@ -2379,7 +2388,7 @@ export default class ReadwisePlugin extends Plugin {
         await this.getExportStatus(this.settings.currentSyncStatusID);
       } else {
         // we probably got some unhandled error...
-        console.log("[Readwise-Phillip] Some unhandled error onLayoutReady");
+        this.logger.error("Some unhandled error onLayoutReady");
         this.settings.isSyncing = false;
         await this.saveSettings();
       }
@@ -2423,6 +2432,10 @@ export default class ReadwisePlugin extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+    // Update logger level when settings change
+    if (this.logger) {
+      this.logger.setLogLevel(this.settings.logLevel);
+    }
   }
 
   getObsidianClientID() {
@@ -2449,25 +2462,25 @@ export default class ReadwisePlugin extends Plugin {
         `${baseURL}/api/auth?token=${uuid}`
       );
     } catch (e) {
-      console.log("[Readwise-Phillip] fetch failed in getUserAuthToken: ", e);
+      this.logger.error("fetch failed in getUserAuthToken: ", e);
     }
     if (response && response.ok) {
       data = await response.json();
     } else {
-      console.log("[Readwise-Phillip] bad response in getUserAuthToken: ", response);
+      this.logger.error("bad response in getUserAuthToken: ", response);
       this.showInfoStatus(button.parentElement, "Authorization failed. Try again", "rw-error");
       return;
     }
     if (data.userAccessToken) {
-      console.log("[Readwise-Phillip] successfully authenticated with Readwise");
+      this.logger.info("successfully authenticated with Readwise");
       this.settings.token = data.userAccessToken;
       await this.saveSettings();
     } else {
       if (attempt > 20) {
-        console.log('[Readwise-Phillip] reached attempt limit in getUserAuthToken');
+        this.logger.warn('reached attempt limit in getUserAuthToken');
         return;
       }
-      console.log(`[Readwise-Phillip] didn't get token data, retrying (attempt ${attempt + 1})`);
+      this.logger.debug(`didn't get token data, retrying (attempt ${attempt + 1})`);
       await new Promise(resolve => setTimeout(resolve, 1000));
       await this.getUserAuthToken(button, attempt + 1);
     }
@@ -2529,7 +2542,7 @@ class ReadwiseSettingTab extends PluginSettingTab {
                 //  it can stop new syncs from happening. Make sure to set isSyncing to false
                 //  if there's ever errors/failures in previous sync attempts, so that
                 //  we don't block syncing subsequent times.
-                console.log("[Readwise-Phillip] Readwise sync already in progress");
+                this.logger.warn("Readwise sync already in progress");
                 new Notice("Readwise sync already in progress");
               } else {
                 this.plugin.clearInfoStatus(containerEl);
@@ -2608,6 +2621,21 @@ class ReadwiseSettingTab extends PluginSettingTab {
           });
         }
         );
+
+      new Setting(containerEl)
+        .setName('Log level')
+        .setDesc('Control console logging verbosity: ERROR (only errors), WARN (warnings + errors, default), INFO (status updates), DEBUG (all details)')
+        .addDropdown(dropdown => {
+          dropdown.addOption(LogLevel.ERROR.toString(), "Error");
+          dropdown.addOption(LogLevel.WARN.toString(), "Warning");
+          dropdown.addOption(LogLevel.INFO.toString(), "Info");
+          dropdown.addOption(LogLevel.DEBUG.toString(), "Debug");
+          dropdown.setValue(this.plugin.settings.logLevel.toString());
+          dropdown.onChange(async (newValue) => {
+            this.plugin.settings.logLevel = parseInt(newValue) as LogLevel;
+            await this.plugin.saveSettings();
+          });
+        });
 
       if (this.plugin.settings.lastSyncFailed) {
         this.plugin.showInfoStatus(containerEl.find(".rw-setting-sync .rw-info-container").parentElement, "Last sync failed", "rw-error");
