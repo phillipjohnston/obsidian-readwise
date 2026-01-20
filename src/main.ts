@@ -2387,10 +2387,12 @@ export default class ReadwisePlugin extends Plugin {
       if (this.settings.isSyncing && this.settings.currentSyncStatusID) {
         await this.getExportStatus(this.settings.currentSyncStatusID);
       } else {
-        // we probably got some unhandled error...
-        this.logger.error("Some unhandled error onLayoutReady");
-        this.settings.isSyncing = false;
-        await this.saveSettings();
+        // Clean up sync state if isSyncing flag was set but no sync ID present
+        if (this.settings.isSyncing) {
+          this.logger.debug("Clearing stale isSyncing flag on layout ready");
+          this.settings.isSyncing = false;
+          await this.saveSettings();
+        }
       }
 
       if (this.settings.triggerOnLoad) {
