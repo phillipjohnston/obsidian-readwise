@@ -1057,32 +1057,69 @@ export default class ReadwisePlugin extends Plugin {
     this.logger.debug(`Book IDs:`, requestBookIds);
     this.logger.debug(`Reader Document IDs:`, requestReaderDocumentIds);
 
-    try {
-      const response = await fetch(
-        // add books to next archive build from this endpoint
-        // NOTE: should only end up calling this endpoint when:
-        // 1. there are failedBooks
-        // 2. there are booksToRefresh
-        `${baseURL}/api/refresh_book_export`,
-        {
-          headers: { ...this.getAuthHeaders(), 'Content-Type': 'application/json' },
-          method: "POST",
-          body: JSON.stringify({
-            exportTarget: 'obsidian',
-            userBookIds: requestBookIds,
-            readerDocumentIds: requestReaderDocumentIds,
-          })
-        }
-      );
+    // Chunk the requests to avoid 502 errors with large payloads
+    const CHUNK_SIZE = 500;
+    const totalItems = requestBookIds.length + requestReaderDocumentIds.length;
 
-      if (response && response.ok) {
-        const responseData = await response.json();
-        this.logger.debug("Response OK from refresh_book_export:", responseData);
-        this.logger.debug("Proceeding to queueExport()");
+    // Helper function to chunk an array
+    const chunkArray = <T>(array: T[], size: number): T[][] => {
+      const chunks: T[][] = [];
+      for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+      }
+      return chunks;
+    };
+
+    // Calculate how many items each type should get in each chunk
+    // Distribute proportionally based on the ratio of book IDs to reader document IDs
+    const bookIdChunks = chunkArray(requestBookIds, CHUNK_SIZE);
+    const readerDocChunks = chunkArray(requestReaderDocumentIds, CHUNK_SIZE);
+    const maxChunks = Math.max(bookIdChunks.length, readerDocChunks.length);
+
+    this.logger.info(`Splitting request into ${maxChunks} chunk(s) of up to ${CHUNK_SIZE} items each`);
+
+    try {
+      let allSuccessful = true;
+
+      for (let i = 0; i < maxChunks; i++) {
+        const chunkBookIds = bookIdChunks[i] || [];
+        const chunkReaderDocIds = readerDocChunks[i] || [];
+        const chunkTotal = chunkBookIds.length + chunkReaderDocIds.length;
+
+        this.logger.info(`Processing chunk ${i + 1}/${maxChunks} with ${chunkTotal} items (${chunkBookIds.length} book IDs, ${chunkReaderDocIds.length} reader docs)`);
+
+        const response = await fetch(
+          // add books to next archive build from this endpoint
+          // NOTE: should only end up calling this endpoint when:
+          // 1. there are failedBooks
+          // 2. there are booksToRefresh
+          `${baseURL}/api/refresh_book_export`,
+          {
+            headers: { ...this.getAuthHeaders(), 'Content-Type': 'application/json' },
+            method: "POST",
+            body: JSON.stringify({
+              exportTarget: 'obsidian',
+              userBookIds: chunkBookIds,
+              readerDocumentIds: chunkReaderDocIds,
+            })
+          }
+        );
+
+        if (response && response.ok) {
+          const responseData = await response.json();
+          this.logger.debug(`Chunk ${i + 1}/${maxChunks} response OK:`, responseData);
+        } else {
+          this.logger.warn(`Chunk ${i + 1}/${maxChunks} failed with status ${response?.status}`);
+          allSuccessful = false;
+        }
+      }
+
+      if (allSuccessful) {
+        this.logger.info("All chunks processed successfully, proceeding to queueExport()");
         await this.queueExport();
         return;
       } else {
-        this.logger.info(`saving book id ${bookIds} to refresh later`);
+        this.logger.info(`Some chunks failed, saving book ids to refresh later`);
         const deduplicatedBookIds = new Set([...this.settings.booksToRefresh, ...bookIds]);
         this.settings.booksToRefresh = Array.from(deduplicatedBookIds);
         await this.saveSettings();
