@@ -1411,8 +1411,6 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(tempFile, diagnosticInfo);
         const file = this.app.vault.getAbstractFileByPath(tempFile);
         if (file) {
-          // Brief delay to allow metadata cache to index the new file
-          await new Promise(resolve => setTimeout(resolve, 100));
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -1522,8 +1520,7 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(tempFile, duplicateReport);
         const file = this.app.vault.getAbstractFileByPath(tempFile);
         if (file) {
-          // Brief delay to allow metadata cache to index the new file
-          await new Promise(resolve => setTimeout(resolve, 100));
+
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -1612,8 +1609,7 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(tempFile, collisionReport);
         const file = this.app.vault.getAbstractFileByPath(tempFile);
         if (file) {
-          // Brief delay to allow metadata cache to index the new file
-          await new Promise(resolve => setTimeout(resolve, 100));
+
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -1718,9 +1714,6 @@ export default class ReadwisePlugin extends Plugin {
           await this.app.vault.create(reportFile, report);
           const file = this.app.vault.getAbstractFileByPath(reportFile);
           if (file) {
-            // Brief delay to allow metadata cache to index the new file
-            // (works around obsidian-banners plugin assuming metadata is always available)
-            await new Promise(resolve => setTimeout(resolve, 100));
             // @ts-ignore
             await this.app.workspace.getLeaf().openFile(file);
           }
@@ -2021,8 +2014,7 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(reportFile, stats);
         const file = this.app.vault.getAbstractFileByPath(reportFile);
         if (file) {
-          // Brief delay to allow metadata cache to index the new file
-          await new Promise(resolve => setTimeout(resolve, 100));
+
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -2126,8 +2118,7 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(reportFile, report);
         const file = this.app.vault.getAbstractFileByPath(reportFile);
         if (file) {
-          // Brief delay to allow metadata cache to index the new file
-          await new Promise(resolve => setTimeout(resolve, 100));
+
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
