@@ -647,7 +647,7 @@ export default class ReadwisePlugin extends Plugin {
 
     // wait for the metadata cache to process created/updated documents
     await new Promise<void>((resolve) => {
-      const timeoutSeconds = 15;
+      const timeoutSeconds = 60;
       this.logger.debug(`waiting for metadata cache processing for up to ${timeoutSeconds}s...`)
       const timeout = setTimeout(() => {
         this.app.metadataCache.offref(eventRef);
