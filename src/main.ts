@@ -1409,6 +1409,8 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(tempFile, diagnosticInfo);
         const file = this.app.vault.getAbstractFileByPath(tempFile);
         if (file) {
+          // Brief delay to allow metadata cache to index the new file
+          await new Promise(resolve => setTimeout(resolve, 100));
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -1518,6 +1520,8 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(tempFile, duplicateReport);
         const file = this.app.vault.getAbstractFileByPath(tempFile);
         if (file) {
+          // Brief delay to allow metadata cache to index the new file
+          await new Promise(resolve => setTimeout(resolve, 100));
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -1606,6 +1610,8 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(tempFile, collisionReport);
         const file = this.app.vault.getAbstractFileByPath(tempFile);
         if (file) {
+          // Brief delay to allow metadata cache to index the new file
+          await new Promise(resolve => setTimeout(resolve, 100));
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -1688,142 +1694,10 @@ export default class ReadwisePlugin extends Plugin {
           Object.entries(categoryCounts).forEach(([cat, count]) => {
             report += `- ${cat}: ${count} items\n`;
           });
-          report += '\n## Missing Items (first 50)\n';
-          missingItems.slice(0, 50).forEach(item => {
-            report += `- [${item.category}] ${item.title} by ${item.author} (ID: ${item.id})\n`;
-          });
-          if (missingItems.length > 50) {
-            report += `\n... and ${missingItems.length - 50} more\n`;
-          }
-
-          report += '\n## Next Steps\n';
-          if (missingItems.length > 0) {
-            report += 'Options to sync these items:\n';
-            report += '1. Run "Force resync missing items" command to add them to refresh queue\n';
-            report += '2. Use recovery script to reset lastSavedStatusID and do a full resync\n';
-          } else {
-            report += 'All items from Readwise are downloaded! ✓\n';
-          }
-
-          this.logger.info(report);
-          new Notice(`Found ${missingItems.length} missing items. Report created.`, 10000);
-
-          // Save report
-          const reportFile = `${this.settings.readwiseDir}/Readwise-Missing-Items-${Date.now()}.md`;
-          await this.app.vault.create(reportFile, report);
-          const file = this.app.vault.getAbstractFileByPath(reportFile);
-          if (file) {
-            // @ts-ignore
-            await this.app.workspace.getLeaf().openFile(file);
-          }
-
-        } catch (e) {
-          this.logger.error('Error finding missing items:', e);
-          new Notice(`Error: ${e.message}`, 10000);
-        }
-      }
-    });
-    this.addCommand({
-      id: 'readwise-official-find-missing-old',
-      name: 'Find and sync missing items (old/slow)',
-      callback: async () => {
-        new Notice('Querying Readwise API for all items...', 10000);
-        this.logger.debug('Fetching all items from API...');
-
-        // Helper function to fetch with retry and rate limiting
-        // Book LIST endpoint: 20 requests per minute = 1 request per 3 seconds
-        const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
-          for (let attempt = 0; attempt < maxRetries; attempt++) {
-            try {
-              const response = await fetch(url, {
-                headers: this.getAuthHeaders()
-              });
-
-              if (response.status === 429) {
-                // Rate limited - use Retry-After header
-                const retryAfter = response.headers.get('Retry-After');
-                const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 60s if no header
-                this.logger.warn(`Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
-                new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
-                await new Promise(resolve => setTimeout(resolve, waitTime));
-                continue;
-              }
-
-              if (!response.ok) {
-                throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-              }
-
-              return response;
-            } catch (e) {
-              if (attempt === maxRetries - 1) throw e;
-              const waitTime = Math.pow(2, attempt) * 1000;
-              this.logger.debug(`Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
-              await new Promise(resolve => setTimeout(resolve, waitTime));
-            }
-          }
-          throw new Error('Max retries exceeded');
-        };
-
-        try {
-          // Fetch all book IDs from Readwise API
-          let allApiBooks: any[] = [];
-          let nextUrl: string | null = 'https://readwise.io/api/v2/books/';
-          let pageCount = 0;
-
-          while (nextUrl && pageCount < 100) { // Safety limit of 100 pages
-            pageCount++;
-            const response = await fetchWithRetry(nextUrl);
-
-            const data = await response.json();
-            allApiBooks = allApiBooks.concat(data.results);
-            nextUrl = data.next;
-
-            if (pageCount % 5 === 0) {
-              this.logger.debug(`Fetched ${allApiBooks.length} items so far...`);
-              new Notice(`Fetched ${allApiBooks.length} items... (page ${pageCount})`, 2000);
-            }
-
-            // Book LIST endpoint limited to 20 requests/minute = 3 seconds between requests
-            if (nextUrl) { // Don't wait after the last page
-              await new Promise(resolve => setTimeout(resolve, 3000));
-            }
-          }
-
-          this.logger.debug(`Fetched total of ${allApiBooks.length} items from API`);
-
-          // Build set of tracked book IDs
-          const trackedIds = new Set(Object.values(this.settings.booksIDsMap));
-          this.logger.debug(`Currently tracking ${trackedIds.size} items locally`);
-
-          // Find missing items
-          const missingItems = allApiBooks.filter(book => {
-            const bookId = book.id.toString();
-            return !trackedIds.has(bookId);
-          });
-
-          this.logger.debug(`Found ${missingItems.length} missing items`);
-
-          // Group by category
-          const categoryCounts: { [cat: string]: number } = {};
+          report += '\n## Missing Items\n';
           missingItems.forEach(item => {
-            const cat = item.category || 'unknown';
-            categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
-          });
-
-          // Create report
-          let report = '# Missing Items Report\n\n';
-          report += `Found **${missingItems.length}** items in Readwise that are not downloaded locally.\n\n`;
-          report += '## Summary by Category\n';
-          Object.entries(categoryCounts).forEach(([cat, count]) => {
-            report += `- ${cat}: ${count} items\n`;
-          });
-          report += '\n## Missing Items (first 50)\n';
-          missingItems.slice(0, 50).forEach(item => {
             report += `- [${item.category}] ${item.title} by ${item.author} (ID: ${item.id})\n`;
           });
-          if (missingItems.length > 50) {
-            report += `\n... and ${missingItems.length - 50} more\n`;
-          }
 
           report += '\n## Next Steps\n';
           if (missingItems.length > 0) {
@@ -1842,6 +1716,9 @@ export default class ReadwisePlugin extends Plugin {
           await this.app.vault.create(reportFile, report);
           const file = this.app.vault.getAbstractFileByPath(reportFile);
           if (file) {
+            // Brief delay to allow metadata cache to index the new file
+            // (works around obsidian-banners plugin assuming metadata is always available)
+            await new Promise(resolve => setTimeout(resolve, 100));
             // @ts-ignore
             await this.app.workspace.getLeaf().openFile(file);
           }
@@ -2142,6 +2019,8 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(reportFile, stats);
         const file = this.app.vault.getAbstractFileByPath(reportFile);
         if (file) {
+          // Brief delay to allow metadata cache to index the new file
+          await new Promise(resolve => setTimeout(resolve, 100));
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
@@ -2245,6 +2124,8 @@ export default class ReadwisePlugin extends Plugin {
         await this.app.vault.create(reportFile, report);
         const file = this.app.vault.getAbstractFileByPath(reportFile);
         if (file) {
+          // Brief delay to allow metadata cache to index the new file
+          await new Promise(resolve => setTimeout(resolve, 100));
           // @ts-ignore
           await this.app.workspace.getLeaf().openFile(file);
         }
