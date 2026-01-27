@@ -223,10 +223,14 @@ export default class ReadwisePlugin extends Plugin {
         const isStuck = data.taskStatus === 'UNKNOWN' && currentBooksExported === lastBooksExported && currentBooksExported > 0;
         const newUnknownCount = data.taskStatus === 'UNKNOWN' ? unknownStatusCount + 1 : 0;
 
-        // If UNKNOWN and no progress for 30 seconds, or UNKNOWN persists for 60 seconds total
-        if (data.taskStatus === 'UNKNOWN' && (unknownStatusCount >= 60 || (isStuck && unknownStatusCount >= 30))) {
-          this.logger.warn(`UNKNOWN status persisted for ${unknownStatusCount} attempts`);
-          this.logger.debug("data at timeout:", data);
+        // Handle UNKNOWN status - log once and check if we should continue
+        if (data.taskStatus === 'UNKNOWN') {
+          // Only log on first encounter
+          if (unknownStatusCount === 0) {
+            const progressInfo = isStuck ? ` - STUCK at ${currentBooksExported}/${data.totalBooks}` : ` - at ${currentBooksExported}/${data.totalBooks}`;
+            this.logger.warn(`UNKNOWN status encountered${progressInfo}`);
+            this.logger.debug("data at UNKNOWN:", data);
+          }
 
           // Check if export is actually complete
           const isComplete = data.isFinished || (data.booksExported && data.totalBooks && data.booksExported >= data.totalBooks);
@@ -244,18 +248,16 @@ export default class ReadwisePlugin extends Plugin {
               this.notice("If you don't see all of your Readwise files, please reload the Obsidian app", true,);
             }
             return;
-          } else {
-            this.logger.error("Export appears incomplete, treating as error");
-            await this.handleSyncError(buttonContext, "Sync timed out with UNKNOWN status");
+          } else if (isStuck) {
+            // If stuck and incomplete, give up without excessive retries
+            this.logger.warn(`Export stuck at ${currentBooksExported}/${data.totalBooks}, treating as incomplete`);
+            await this.handleSyncError(buttonContext, "Sync incomplete - export stuck with UNKNOWN status");
             return;
           }
+          // If not stuck and not complete, fall through to continue polling (export may still be progressing)
         }
 
         if (WAITING_STATUSES.includes(data.taskStatus) || data.taskStatus === 'UNKNOWN') {
-          if (data.taskStatus === 'UNKNOWN') {
-            const progressInfo = isStuck ? ` - STUCK at ${currentBooksExported}/${data.totalBooks}` : ` - progressing (${currentBooksExported}/${data.totalBooks})`;
-            this.logger.warn(`UNKNOWN status encountered (attempt ${newUnknownCount}/60)${progressInfo}`);
-          }
           if (data.booksExported) {
             const progressMsg = `Exporting Readwise data (${data.booksExported} / ${data.totalBooks}) ...`;
             this.notice(progressMsg, false, 35, true);
