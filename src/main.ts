@@ -2087,6 +2087,16 @@ export default class ReadwisePlugin extends Plugin {
       }
     });
     this.addCommand({
+      id: 'readwise-official-update-cache',
+      name: 'Update book cache',
+      callback: async () => {
+        const cache = await this.updateBooksCache(true);
+        if (!cache) {
+          new Notice('Cache update failed. Check the console for details.', 5000);
+        }
+      }
+    });
+    this.addCommand({
       id: 'readwise-official-clear-cache',
       name: 'Clear book cache',
       callback: async () => {
