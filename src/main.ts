@@ -761,43 +761,43 @@ export default class ReadwisePlugin extends Plugin {
     return `${ageDays} days ago`;
   }
 
+  async fetchWithRetry(url: string, showNotices: boolean = true, maxRetries = 5): Promise<Response> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const response = await fetch(url, {
+          headers: this.getAuthHeaders()
+        });
+
+        if (response.status === 429) {
+          const retryAfter = response.headers.get('Retry-After');
+          const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
+          this.logger.warn(`Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
+          if (showNotices) {
+            new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
+          }
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          continue;
+        }
+
+        if (!response.ok) {
+          throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+        }
+
+        return response;
+      } catch (e) {
+        if (attempt === maxRetries - 1) throw e;
+        const waitTime = Math.pow(2, attempt) * 1000;
+        this.logger.debug(`Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+    throw new Error('Max retries exceeded');
+  }
+
   async buildBooksCache(showNotices: boolean = true): Promise<ReadwiseBooksCache | null> {
     if (showNotices) {
       new Notice('Building book cache from Readwise API...', 10000);
     }
-
-    const fetchWithRetry = async (url: string, maxRetries = 5): Promise<Response> => {
-      for (let attempt = 0; attempt < maxRetries; attempt++) {
-        try {
-          const response = await fetch(url, {
-            headers: this.getAuthHeaders()
-          });
-
-          if (response.status === 429) {
-            const retryAfter = response.headers.get('Retry-After');
-            const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000;
-            this.logger.warn(`Rate limited (429). Retry-After: ${waitTime/1000}s. Waiting before retry ${attempt + 1}/${maxRetries}...`);
-            if (showNotices) {
-              new Notice(`Rate limited. Waiting ${Math.ceil(waitTime/1000)}s before retry...`, Math.min(waitTime, 10000));
-            }
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-            continue;
-          }
-
-          if (!response.ok) {
-            throw new Error(`API request failed: ${response.status} ${response.statusText}`);
-          }
-
-          return response;
-        } catch (e) {
-          if (attempt === maxRetries - 1) throw e;
-          const waitTime = Math.pow(2, attempt) * 1000;
-          this.logger.debug(`Error on attempt ${attempt + 1}, retrying in ${waitTime/1000}s...`);
-          await new Promise(resolve => setTimeout(resolve, waitTime));
-        }
-      }
-      throw new Error('Max retries exceeded');
-    };
 
     try {
       let allApiBooks: any[] = [];
@@ -806,7 +806,7 @@ export default class ReadwisePlugin extends Plugin {
 
       while (nextUrl && pageCount < 100) {
         pageCount++;
-        const response = await fetchWithRetry(nextUrl);
+        const response = await this.fetchWithRetry(nextUrl, showNotices);
         const data = await response.json();
         allApiBooks = allApiBooks.concat(data.results);
         nextUrl = data.next;
