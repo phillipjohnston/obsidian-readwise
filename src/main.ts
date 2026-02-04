@@ -877,6 +877,120 @@ export default class ReadwisePlugin extends Plugin {
     }
   }
 
+  /** Incrementally update the books cache using /api/v2/export/?updatedAfter.
+   * Falls back to full rebuild if no cache exists. */
+  async updateBooksCache(showNotices: boolean = true): Promise<ReadwiseBooksCache | null> {
+    // Load existing cache — if missing, full rebuild is the only option
+    let cache = await this.loadBooksCache();
+    if (!cache) {
+      this.logger.info('updateBooksCache: no existing cache, falling back to full rebuild');
+      if (showNotices) {
+        new Notice('No existing cache found. Running full cache build...', 5000);
+      }
+      return await this.buildBooksCache(showNotices);
+    }
+
+    if (showNotices) {
+      new Notice(`Updating cache (last updated: ${cache.lastUpdated})...`, 10000);
+    }
+    this.logger.info(`updateBooksCache: fetching changes since ${cache.lastUpdated}`);
+
+    try {
+      let updatedBooks = 0;
+      let newBooks = 0;
+      let nextPageCursor: string | null = null;
+      let isFirstPage = true;
+
+      do {
+        let url = `${baseURL}/api/v2/export/?updatedAfter=${encodeURIComponent(cache.lastUpdated)}`;
+        if (nextPageCursor) {
+          url += `&pageCursor=${encodeURIComponent(nextPageCursor)}`;
+        }
+
+        this.logger.debug(`updateBooksCache: fetching ${url}`);
+        const response = await this.fetchWithRetry(url, showNotices);
+        const data = await response.json();
+
+        nextPageCursor = data.nextPageCursor || null;
+
+        for (const book of data.results) {
+          const bookId = book.user_book_id.toString();
+          const category = book.category || 'articles';
+
+          // Derive last_highlight_at from the highlights array
+          let lastHighlightAt: string | undefined;
+          if (book.highlights && book.highlights.length > 0) {
+            lastHighlightAt = book.highlights
+              .map((h: any) => h.updated_at)
+              .filter(Boolean)
+              .sort()
+              .pop();
+          }
+
+          const cachedBook: CachedBook = {
+            id: bookId,
+            title: book.title || 'Untitled',
+            author: book.author || 'Unknown',
+            category: category,
+            source_url: book.source_url,
+            num_highlights: book.highlights ? book.highlights.length : 0,
+            last_highlight_at: lastHighlightAt,
+            updated_at: lastHighlightAt,
+          };
+
+          const isNew = !cache.byId[bookId];
+          cache.byId[bookId] = cachedBook;
+
+          if (isNew) {
+            newBooks++;
+          } else {
+            updatedBooks++;
+          }
+        }
+
+        if (isFirstPage && data.results.length === 0) {
+          this.logger.info('updateBooksCache: no changes since last update');
+          if (showNotices) {
+            new Notice('Cache is already up to date.', 3000);
+          }
+          return cache;
+        }
+        isFirstPage = false;
+
+      } while (nextPageCursor);
+
+      // Rebuild byCategory from the full byId map
+      cache.byCategory = { articles: [], books: [], tweets: [], podcasts: [] };
+      for (const bookId of Object.keys(cache.byId)) {
+        const category = cache.byId[bookId].category;
+        if (category in cache.byCategory) {
+          cache.byCategory[category as keyof typeof cache.byCategory].push(bookId);
+        }
+      }
+
+      // Update metadata
+      cache.totalBooks = Object.keys(cache.byId).length;
+      cache.lastUpdated = new Date().toISOString();
+
+      // Persist
+      await this.saveBooksCache(cache);
+      this.booksCache = cache;
+
+      this.logger.info(`updateBooksCache: done. ${newBooks} new, ${updatedBooks} updated. Total: ${cache.totalBooks}`);
+      if (showNotices) {
+        new Notice(`Cache updated: ${newBooks} new, ${updatedBooks} updated (${cache.totalBooks} total)`, 5000);
+      }
+
+      return cache;
+    } catch (e) {
+      this.logger.error('Error updating cache:', e);
+      if (showNotices) {
+        new Notice(`Error updating cache: ${e.message}`, 10000);
+      }
+      return null;
+    }
+  }
+
   /** Fetch and save highlights for specific book IDs directly via API.
    * Bypasses export system for faster targeted refresh. */
   async syncSpecificBooksDirect(bookIds: string[]): Promise<{ success: number, failed: string[] }> {
