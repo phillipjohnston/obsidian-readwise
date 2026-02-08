@@ -2392,6 +2392,181 @@ export default class ReadwisePlugin extends Plugin {
         modal.open();
       }
     });
+    this.addCommand({
+      id: 'readwise-official-find-ghosts',
+      name: 'Find ghost entries (tracked files that don\'t exist)',
+      callback: async () => {
+        new Notice('Scanning for ghost entries...', 5000);
+
+        // Load cache if available (for enrichment, not required)
+        if (!this.booksCache) {
+          this.booksCache = await this.loadBooksCache();
+        }
+
+        const ghostEntries: Array<{ filePath: string, bookId: string, title?: string, author?: string, category: string }> = [];
+
+        for (const [filePath, bookId] of Object.entries(this.settings.booksIDsMap)) {
+          const exists = await this.app.vault.adapter.exists(filePath);
+          if (!exists) {
+            // Extract category from file path (e.g., "Readwise/Articles/foo.md" -> "Articles")
+            const parts = filePath.split('/');
+            const category = parts.length >= 2 ? parts[parts.length - 2] : 'Unknown';
+
+            // Enrich with cache metadata if available
+            let title: string | undefined;
+            let author: string | undefined;
+            if (this.booksCache?.byId[bookId]) {
+              const cached = this.booksCache.byId[bookId];
+              title = cached.title;
+              author = cached.author;
+            }
+
+            ghostEntries.push({ filePath, bookId, title, author, category });
+          }
+        }
+
+        // Group by category
+        const byCategory: { [cat: string]: typeof ghostEntries } = {};
+        ghostEntries.forEach(entry => {
+          if (!byCategory[entry.category]) {
+            byCategory[entry.category] = [];
+          }
+          byCategory[entry.category].push(entry);
+        });
+
+        // Generate report
+        let report = '# Ghost Entry Report\n\n';
+        report += `**Generated:** ${new Date().toISOString()}\n\n`;
+        report += `**Total ghost entries:** ${ghostEntries.length}\n`;
+        report += `**Total tracked entries:** ${Object.keys(this.settings.booksIDsMap).length}\n\n`;
+
+        report += 'Ghost entries are files tracked in booksIDsMap that no longer exist on disk.\n';
+        report += 'This typically happens when files are deleted outside of Obsidian.\n\n';
+
+        if (ghostEntries.length === 0) {
+          report += '## Result\n\nNo ghost entries found! All tracked files exist on disk. ✓\n';
+        } else {
+          const categories = Object.keys(byCategory).sort();
+          for (const category of categories) {
+            const entries = byCategory[category];
+            report += `## ${category} (${entries.length})\n\n`;
+            entries.forEach(entry => {
+              if (entry.title) {
+                report += `- **${entry.title}**${entry.author ? ` by ${entry.author}` : ''} (ID: \`${entry.bookId}\`)\n`;
+                report += `  - Path: \`${entry.filePath}\`\n`;
+              } else {
+                report += `- \`${entry.filePath}\` (ID: \`${entry.bookId}\`)\n`;
+              }
+            });
+            report += '\n';
+          }
+
+          report += '## Next Steps\n\n';
+          report += '1. Run **"Fix ghost entries (clean and resync)"** to remove these entries and re-download the files\n';
+          report += '2. Or manually delete entries from `data.json` if you don\'t want them re-synced\n';
+        }
+
+        this.logger.info(report);
+        new Notice(`Found ${ghostEntries.length} ghost entries. Report created.`, 10000);
+
+        const reportFile = `${this.settings.readwiseDir}/Ghost-Entry-Report-${Date.now()}.md`;
+        await this.app.vault.create(reportFile, report);
+        const file = this.app.vault.getAbstractFileByPath(reportFile);
+        if (file) {
+          // @ts-ignore
+          await this.app.workspace.getLeaf().openFile(file);
+        }
+      }
+    });
+    this.addCommand({
+      id: 'readwise-official-fix-ghosts',
+      name: 'Fix ghost entries (clean and resync)',
+      callback: async () => {
+        new Notice('Scanning for ghost entries...', 3000);
+
+        // Find ghost entries
+        const ghostEntries: Array<{ filePath: string, bookId: string }> = [];
+
+        for (const [filePath, bookId] of Object.entries(this.settings.booksIDsMap)) {
+          const exists = await this.app.vault.adapter.exists(filePath);
+          if (!exists) {
+            ghostEntries.push({ filePath, bookId });
+          }
+        }
+
+        if (ghostEntries.length === 0) {
+          new Notice('No ghost entries found! All tracked files exist.', 5000);
+          return;
+        }
+
+        // Collect unique book IDs for resync
+        const uniqueBookIds = [...new Set(ghostEntries.map(e => e.bookId))];
+
+        // Show confirmation modal
+        const modal = new Modal(this.app);
+        modal.titleEl.setText("Fix Ghost Entries");
+
+        modal.contentEl.createEl('p', {
+          text: `Found ${ghostEntries.length} ghost entries (${uniqueBookIds.length} unique books).`
+        });
+
+        modal.contentEl.createEl('p', {
+          text: `This will:`
+        });
+
+        const list = modal.contentEl.createEl('ul');
+        list.createEl('li', { text: `Remove ${ghostEntries.length} ghost entries from booksIDsMap` });
+        list.createEl('li', { text: `Re-download ${uniqueBookIds.length} books via direct API sync` });
+
+        modal.contentEl.createEl('p', {
+          text: 'Files will be recreated using the current filename template.'
+        });
+
+        const buttonsContainer = modal.contentEl.createEl('div', { cls: "rw-modal-btns" });
+        const cancelBtn = buttonsContainer.createEl("button", { text: "Cancel" });
+        const confirmBtn = buttonsContainer.createEl("button", { text: "Clean and Resync" });
+
+        cancelBtn.onclick = () => modal.close();
+        confirmBtn.onclick = async () => {
+          modal.close();
+          new Notice('Removing ghost entries...', 5000);
+
+          // Remove ghost entries from booksIDsMap
+          let removedCount = 0;
+          for (const { filePath } of ghostEntries) {
+            delete this.settings.booksIDsMap[filePath];
+            removedCount++;
+          }
+          await this.saveSettings();
+
+          this.logger.info(`Removed ${removedCount} ghost entries from booksIDsMap`);
+          new Notice(`Removed ${removedCount} ghost entries. Syncing ${uniqueBookIds.length} books...`, 5000);
+
+          // Re-download via direct API
+          try {
+            const results = await this.syncSpecificBooksDirect(uniqueBookIds);
+
+            if (results.success > 0) {
+              new Notice(`✓ Successfully re-synced ${results.success} items!`, 5000);
+            }
+
+            if (results.failed.length > 0) {
+              new Notice(`⚠️ Failed to sync ${results.failed.length} items. Check console for details.`, 10000);
+              this.logger.error(`Failed ghost resync book IDs:`, results.failed);
+
+              // Add failed items to failedBooks queue for retry
+              this.settings.failedBooks = [...new Set([...this.settings.failedBooks, ...results.failed])];
+              await this.saveSettings();
+            }
+          } catch (e) {
+            this.logger.error('Error during ghost entry resync:', e);
+            new Notice(`Error during resync: ${e.message}`, 10000);
+          }
+        };
+
+        modal.open();
+      }
+    });
     this.registerMarkdownPostProcessor((el, ctx) => {
       if (!ctx.sourcePath.startsWith(this.settings.readwiseDir)) {
         return;
