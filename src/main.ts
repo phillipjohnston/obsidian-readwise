@@ -1000,10 +1000,13 @@ export default class ReadwisePlugin extends Plugin {
 
     for (const bookId of bookIds) {
       try {
-        this.logger.debug(`syncSpecificBooksDirect: Fetching book ${bookId}`);
+        // Decode reader document IDs: stored as "readerdocument:{id}" but
+        // the /api/v2/books/ endpoint uses the raw numeric ID
+        const apiBookId = this.decodeReaderDocumentId(bookId) || bookId;
+        this.logger.debug(`syncSpecificBooksDirect: Fetching book ${bookId} (API ID: ${apiBookId})`);
 
         // Fetch book metadata
-        const bookResponse = await fetch(`${baseURL}/api/v2/books/${bookId}/`, {
+        const bookResponse = await fetch(`${baseURL}/api/v2/books/${apiBookId}/`, {
           headers: this.getAuthHeaders()
         });
 
@@ -1023,10 +1026,34 @@ export default class ReadwisePlugin extends Plugin {
           continue;
         }
 
-        // Fetch highlights
-        const highlightsResponse = await fetch(`${baseURL}/api/v2/books/${bookId}/highlights/`, {
-          headers: this.getAuthHeaders()
-        });
+        // Fetch highlights via /api/v2/highlights/?book_id={id} (paginated)
+        let highlights: any[] = [];
+        let highlightsFailed = false;
+        let highlightsError = { status: 0, statusText: '' };
+        let highlightsNextUrl: string | null = `${baseURL}/api/v2/highlights/?book_id=${apiBookId}&page_size=1000`;
+
+        while (highlightsNextUrl) {
+          const highlightsResponse = await fetch(highlightsNextUrl, {
+            headers: this.getAuthHeaders()
+          });
+
+          if (!highlightsResponse.ok) {
+            this.logger.error(`Failed to fetch highlights for book ${bookId}: ${highlightsResponse.status}`);
+            highlightsFailed = true;
+            highlightsError = { status: highlightsResponse.status, statusText: highlightsResponse.statusText };
+            break;
+          }
+
+          const highlightsData = await highlightsResponse.json();
+          highlights = highlights.concat(highlightsData.results || []);
+          highlightsNextUrl = highlightsData.next;
+
+          if (highlightsNextUrl) {
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          }
+        }
+
+        this.logger.debug(`Fetched ${highlights.length} highlights for book ${bookId}`);
 
         const category = book.category.charAt(0).toUpperCase() + book.category.slice(1);
         let content = `# ${book.title}\n\n`;
@@ -1037,19 +1064,13 @@ export default class ReadwisePlugin extends Plugin {
         }
         content += `\n---\n\n`;
 
-        if (!highlightsResponse.ok) {
-          this.logger.error(`Failed to fetch highlights for book ${bookId}: ${highlightsResponse.status}`);
-
+        if (highlightsFailed) {
           // Create stub file documenting the failure
-          content += `## ⚠️ Sync Error\n\n`;
+          content += `## Sync Error\n\n`;
           content += `**Status:** Failed to sync highlights from Readwise API\n\n`;
-          content += `**Error:** API returned ${highlightsResponse.status} (${highlightsResponse.statusText})\n\n`;
+          content += `**Error:** API returned ${highlightsError.status} (${highlightsError.statusText})\n\n`;
           content += `**Book ID:** ${bookId}\n\n`;
           content += `**Expected Highlights:** ${book.num_highlights}\n\n`;
-          content += `**Details:**\n`;
-          content += `- The Readwise API reports this book has ${book.num_highlights} highlight(s)\n`;
-          content += `- However, the highlights endpoint returned a 404 error\n`;
-          content += `- This indicates a server-side data issue with this book\n\n`;
           content += `**What you can do:**\n`;
           content += `1. Try viewing this book on readwise.io/library to see if highlights appear there\n`;
           content += `2. Contact Readwise support about book ID ${bookId} if highlights are missing\n`;
@@ -1059,11 +1080,6 @@ export default class ReadwisePlugin extends Plugin {
 
           this.logger.info(`Creating stub file for inaccessible book ${bookId}`);
         } else {
-          const highlightsData = await highlightsResponse.json();
-          const highlights = highlightsData.results;
-
-          this.logger.debug(`Fetched ${highlights.length} highlights for book ${bookId}`);
-
           // Add highlights
           highlights.forEach((highlight: any) => {
             content += `## ${highlight.text}\n\n`;
