@@ -991,133 +991,7 @@ export default class ReadwisePlugin extends Plugin {
     }
   }
 
-  /** Fetch and save highlights for specific book IDs directly via API.
-   * Bypasses export system for faster targeted refresh. */
-  async syncSpecificBooksDirect(bookIds: string[]): Promise<{ success: number, failed: string[] }> {
-    this.logger.info(`syncSpecificBooksDirect: Syncing ${bookIds.length} books via direct API`);
 
-    const results = { success: 0, failed: [] as string[] };
-
-    for (const bookId of bookIds) {
-      try {
-        // Decode reader document IDs: stored as "readerdocument:{id}" but
-        // the /api/v2/books/ endpoint uses the raw numeric ID
-        const apiBookId = this.decodeReaderDocumentId(bookId) || bookId;
-        this.logger.debug(`syncSpecificBooksDirect: Fetching book ${bookId} (API ID: ${apiBookId})`);
-
-        // Fetch book metadata
-        const bookResponse = await fetch(`${baseURL}/api/v2/books/${apiBookId}/`, {
-          headers: this.getAuthHeaders()
-        });
-
-        if (!bookResponse.ok) {
-          this.logger.error(`Failed to fetch book ${bookId}: ${bookResponse.status}`);
-          results.failed.push(bookId);
-          continue;
-        }
-
-        const book = await bookResponse.json();
-        this.logger.debug(`Book ${bookId}: "${book.title}" (${book.category}), ${book.num_highlights} highlights`);
-
-        // Skip if no highlights
-        if (book.num_highlights === 0) {
-          this.logger.debug(`Skipping book ${bookId} - no highlights`);
-          results.failed.push(bookId);
-          continue;
-        }
-
-        // Fetch highlights via /api/v2/highlights/?book_id={id} (paginated)
-        let highlights: any[] = [];
-        let highlightsFailed = false;
-        let highlightsError = { status: 0, statusText: '' };
-        let highlightsNextUrl: string | null = `${baseURL}/api/v2/highlights/?book_id=${apiBookId}&page_size=1000`;
-
-        while (highlightsNextUrl) {
-          const highlightsResponse = await fetch(highlightsNextUrl, {
-            headers: this.getAuthHeaders()
-          });
-
-          if (!highlightsResponse.ok) {
-            this.logger.error(`Failed to fetch highlights for book ${bookId}: ${highlightsResponse.status}`);
-            highlightsFailed = true;
-            highlightsError = { status: highlightsResponse.status, statusText: highlightsResponse.statusText };
-            break;
-          }
-
-          const highlightsData = await highlightsResponse.json();
-          highlights = highlights.concat(highlightsData.results || []);
-          highlightsNextUrl = highlightsData.next;
-
-          if (highlightsNextUrl) {
-            await new Promise(resolve => setTimeout(resolve, 3000));
-          }
-        }
-
-        this.logger.debug(`Fetched ${highlights.length} highlights for book ${bookId}`);
-
-        const category = book.category.charAt(0).toUpperCase() + book.category.slice(1);
-        let content = `# ${book.title}\n\n`;
-        content += `**Author:** ${book.author || 'Unknown'}\n`;
-        content += `**Category:** ${book.category}\n`;
-        if (book.source_url) {
-          content += `**Source:** ${book.source_url}\n`;
-        }
-        content += `\n---\n\n`;
-
-        if (highlightsFailed) {
-          // Create stub file documenting the failure
-          content += `## Sync Error\n\n`;
-          content += `**Status:** Failed to sync highlights from Readwise API\n\n`;
-          content += `**Error:** API returned ${highlightsError.status} (${highlightsError.statusText})\n\n`;
-          content += `**Book ID:** ${bookId}\n\n`;
-          content += `**Expected Highlights:** ${book.num_highlights}\n\n`;
-          content += `**What you can do:**\n`;
-          content += `1. Try viewing this book on readwise.io/library to see if highlights appear there\n`;
-          content += `2. Contact Readwise support about book ID ${bookId} if highlights are missing\n`;
-          content += `3. If highlights appear on the website, try deleting this file and re-syncing\n`;
-          content += `4. This file was created as a placeholder to prevent continuous "missing item" errors\n\n`;
-          content += `**Sync Attempted:** ${new Date().toISOString()}\n`;
-
-          this.logger.info(`Creating stub file for inaccessible book ${bookId}`);
-        } else {
-          // Add highlights
-          highlights.forEach((highlight: any) => {
-            content += `## ${highlight.text}\n\n`;
-            if (highlight.note) {
-              content += `**Note:** ${highlight.note}\n\n`;
-            }
-            if (highlight.tags && highlight.tags.length > 0) {
-              content += `**Tags:** ${highlight.tags.map((t: any) => t.name).join(', ')}\n\n`;
-            }
-            content += `---\n\n`;
-          });
-        }
-
-        // Save file
-        const fileName = `${this.settings.readwiseDir}/${category}/${book.title}.md`;
-        const finalFileName = this.resolveFilenameCollision(fileName, bookId);
-
-        await this.createDirForFile(finalFileName);
-        await this.app.vault.adapter.write(finalFileName, content);
-
-        // Track in booksIDsMap
-        this.settings.booksIDsMap[finalFileName] = bookId;
-
-        this.logger.info(`✓ Saved book ${bookId} to ${finalFileName}`);
-        results.success++;
-
-      } catch (e) {
-        this.logger.error(`Error syncing book ${bookId}:`, e);
-        results.failed.push(bookId);
-      }
-
-      // Rate limiting: 20 requests per minute = 3 seconds between requests
-      await new Promise(resolve => setTimeout(resolve, 3000));
-    }
-
-    await this.saveSettings();
-    return results;
-  }
 
   async configureSchedule() {
     const minutes = parseInt(this.settings.frequency);
@@ -1923,7 +1797,7 @@ export default class ReadwisePlugin extends Plugin {
     });
     this.addCommand({
       id: 'readwise-official-direct-resync',
-      name: 'Direct resync missing items (fast)',
+      name: 'Resync missing items',
       callback: async () => {
         // Check cache
         if (!this.booksCache) {
@@ -1960,29 +1834,15 @@ export default class ReadwisePlugin extends Plugin {
             return;
           }
 
-          this.logger.info(`Direct sync for ${missingBookIds.length} missing items (items with 0 highlights excluded)`);
+          this.logger.info(`Queueing ${missingBookIds.length} missing items for export sync (items with 0 highlights excluded)`);
 
-          new Notice(`Syncing ${missingBookIds.length} items directly via API...`, 5000);
-
-          // Use direct API instead of export system
-          const results = await this.syncSpecificBooksDirect(missingBookIds);
-
-          if (results.success > 0) {
-            new Notice(`✓ Successfully synced ${results.success} items!`, 5000);
-          }
-
-          if (results.failed.length > 0) {
-            new Notice(`⚠️ Failed to sync ${results.failed.length} items. Check console for details.`, 10000);
-            this.logger.error(`Failed book IDs:`, results.failed);
-
-            // Add failed items to failedBooks queue
-            this.settings.failedBooks = [...new Set([...this.settings.failedBooks, ...results.failed])];
-            await this.saveSettings();
-          }
-
-          // Clear booksToRefresh since we just synced them
-          this.settings.booksToRefresh = [];
+          // Queue for re-export via normal sync pipeline
+          this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...missingBookIds])];
           await this.saveSettings();
+
+          new Notice(`Queued ${missingBookIds.length} missing items for sync. Starting sync...`, 5000);
+
+          await this.syncBookHighlights();
 
         } catch (e) {
           this.logger.error('Error direct syncing:', e);
@@ -2532,10 +2392,10 @@ export default class ReadwisePlugin extends Plugin {
 
         const list = modal.contentEl.createEl('ul');
         list.createEl('li', { text: `Remove ${ghostEntries.length} ghost entries from booksIDsMap` });
-        list.createEl('li', { text: `Re-download ${uniqueBookIds.length} books via direct API sync` });
+        list.createEl('li', { text: `Queue ${uniqueBookIds.length} books for re-export via Readwise sync` });
 
         modal.contentEl.createEl('p', {
-          text: 'Files will be recreated using the current filename template.'
+          text: 'Files will be recreated using your Readwise export template on next sync.'
         });
 
         const buttonsContainer = modal.contentEl.createEl('div', { cls: "rw-modal-btns" });
@@ -2556,24 +2416,16 @@ export default class ReadwisePlugin extends Plugin {
           await this.saveSettings();
 
           this.logger.info(`Removed ${removedCount} ghost entries from booksIDsMap`);
-          new Notice(`Removed ${removedCount} ghost entries. Syncing ${uniqueBookIds.length} books...`, 5000);
 
-          // Re-download via direct API
+          // Queue for re-export via normal sync pipeline
+          this.settings.booksToRefresh = [...new Set([...this.settings.booksToRefresh, ...uniqueBookIds])];
+          await this.saveSettings();
+
+          new Notice(`Removed ${removedCount} ghost entries. Queued ${uniqueBookIds.length} books for resync. Starting sync...`, 5000);
+
+          // Trigger sync via the normal export pipeline
           try {
-            const results = await this.syncSpecificBooksDirect(uniqueBookIds);
-
-            if (results.success > 0) {
-              new Notice(`✓ Successfully re-synced ${results.success} items!`, 5000);
-            }
-
-            if (results.failed.length > 0) {
-              new Notice(`⚠️ Failed to sync ${results.failed.length} items. Check console for details.`, 10000);
-              this.logger.error(`Failed ghost resync book IDs:`, results.failed);
-
-              // Add failed items to failedBooks queue for retry
-              this.settings.failedBooks = [...new Set([...this.settings.failedBooks, ...results.failed])];
-              await this.saveSettings();
-            }
+            await this.syncBookHighlights();
           } catch (e) {
             this.logger.error('Error during ghost entry resync:', e);
             new Notice(`Error during resync: ${e.message}`, 10000);
