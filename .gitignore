@@ -2,6 +2,9 @@
 *.iml
 .idea
 
+# symlinks in container repo
+.claude/skills/readwise
+
 # npm
 node_modules
 package-lock.json
