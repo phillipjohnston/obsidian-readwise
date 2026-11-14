@@ -174,6 +174,29 @@ export default class ReadwisePlugin extends Plugin {
       this.showInfoStatus(buttonContext.buttonEl.parentNode.parentElement, msg, "rw-success");
       buttonContext.buttonEl.setText("Run sync");
     }
+    // keep the book cache fresh so missing-item detection sees new items
+    void this.autoRefreshBooksCache();
+  }
+
+  private cacheRefreshInProgress = false;
+
+  /** Incrementally refresh the books cache in the background (silent).
+   * Skips if a refresh is running or the cache was updated within maxAgeMs. */
+  async autoRefreshBooksCache(maxAgeMs: number = 60 * 60 * 1000) {
+    if (this.cacheRefreshInProgress) return;
+    this.cacheRefreshInProgress = true;
+    try {
+      const cache = this.booksCache ?? await this.loadBooksCache();
+      if (cache && Date.now() - new Date(cache.lastUpdated).getTime() < maxAgeMs) {
+        return;
+      }
+      this.logger.info('Auto-refreshing books cache');
+      await this.updateBooksCache(false);
+    } catch (e) {
+      this.logger.error('Auto cache refresh failed:', e);
+    } finally {
+      this.cacheRefreshInProgress = false;
+    }
   }
 
   /** Polls the Readwise API for the status of a given export;
@@ -2476,6 +2499,9 @@ export default class ReadwisePlugin extends Plugin {
       if (this.settings.triggerOnLoad) {
         await this.syncBookHighlights(undefined, true);
       }
+
+      // also refresh on load if the cache is over a day old
+      void this.autoRefreshBooksCache(24 * 60 * 60 * 1000);
 
       await this.configureSchedule();
 
