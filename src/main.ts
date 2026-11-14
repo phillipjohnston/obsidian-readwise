@@ -478,6 +478,10 @@ export default class ReadwisePlugin extends Plugin {
     const targetBookIds = new Set([...this.settings.booksToRefresh, ...this.settings.failedBooks]);
 
     if (hasTargetedRefresh) {
+      // remember what we asked for so unresolved items can be dropped once the sync completes
+      if (!this.refreshTargetsSnapshot) {
+        this.refreshTargetsSnapshot = new Set(targetBookIds);
+      }
       this.logger.debug(`downloadArtifact: Targeted refresh for ${targetBookIds.size} specific items`);
       this.logger.debug(`downloadArtifact: Target IDs:`, Array.from(targetBookIds));
     }
@@ -511,7 +515,6 @@ export default class ReadwisePlugin extends Plugin {
     const foundTargetIds = new Set<string>();
     const allBookIdsInArtifact: string[] = [];
     let processedCount = 0;
-    let skippedCount = 0;
 
     if (entries.length) {
       for (const entry of entries) {
@@ -545,10 +548,11 @@ export default class ReadwisePlugin extends Plugin {
             allBookIdsInArtifact.push(bookID);
           }
 
-          // If doing targeted refresh, skip entries not in target list
-          if (hasTargetedRefresh && bookID && !targetBookIds.has(bookID)) {
-            skippedCount++;
-            continue; // Skip this entry entirely
+          // NOTE: do NOT skip entries that aren't in the target list. The artifact
+          // also carries new/updated items, and the sync is acknowledged afterwards,
+          // so skipping them would lose them permanently.
+          if (bookID) {
+            this.refreshTargetsFound.add(bookID);
           }
 
           // Track if this is one of our target items
@@ -649,8 +653,7 @@ export default class ReadwisePlugin extends Plugin {
     if (hasTargetedRefresh) {
       this.logger.debug(`downloadArtifact SUMMARY for artifact ${artifactId}:`);
       this.logger.debug(`  Total entries in artifact: ${entries.length}`);
-      this.logger.debug(`  Processed (target items): ${processedCount}`);
-      this.logger.debug(`  Skipped (not in target list): ${skippedCount}`);
+      this.logger.debug(`  Processed entries: ${processedCount}`);
       this.logger.debug(`  Target items found: ${foundTargetIds.size} of ${targetBookIds.size}`);
 
       if (foundTargetIds.size > 0) {
@@ -687,7 +690,30 @@ export default class ReadwisePlugin extends Plugin {
     });
   }
 
+  /** Queued items the server never returned, tracked across the artifacts of one sync. */
+  private refreshTargetsSnapshot: Set<string> | null = null;
+  private refreshTargetsFound = new Set<string>();
+
+  /** Drop queued refresh/failed IDs that were requested but never appeared in any
+   * artifact this sync. Otherwise they stay queued forever. */
+  async dropUnresolvedRefreshTargets() {
+    const snapshot = this.refreshTargetsSnapshot;
+    const found = this.refreshTargetsFound;
+    this.refreshTargetsSnapshot = null;
+    this.refreshTargetsFound = new Set();
+    if (!snapshot) return;
+
+    const unresolved = Array.from(snapshot).filter(id => !found.has(id));
+    if (!unresolved.length) return;
+
+    this.logger.warn(`Dropping ${unresolved.length} queued item(s) not returned by the server:`, unresolved);
+    this.settings.booksToRefresh = this.settings.booksToRefresh.filter(id => !unresolved.includes(id));
+    this.settings.failedBooks = this.settings.failedBooks.filter(id => !unresolved.includes(id));
+    await this.saveSettings();
+  }
+
   async acknowledgeSyncCompleted(buttonContext: ButtonComponent) {
+    await this.dropUnresolvedRefreshTargets();
     let response;
     try {
       response = await fetch(
